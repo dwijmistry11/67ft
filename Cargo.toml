@@ -1,0 +1,23 @@
+[package]
+name = "sixtyseven-ft"
+version = "0.1.0"
+edition = "2021"
+description = "Self-hosted paywall bypass proxy — a Rust alternative to 12ft.io"
+
+[[bin]]
+name = "67ft"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "brotli", "deflate"] }
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = "z"     # optimize for size
+lto = true
+codegen-units = 1
+strip = true

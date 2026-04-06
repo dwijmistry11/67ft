@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>67ft — Bypass Paywalls</title>
+  <style>
+    *,
+    *::before,
+    *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    :root {
+      --bg: #0d0d0d;
+      --surface: #1a1a1a;
+      --border: #2a2a2a;
+      --accent: #7c6af7;
+      --accent-hover: #9b8dff;
+      --text: #e8e8e8;
+      --muted: #666;
+      --radius: 10px;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 1.5rem;
+      gap: 2rem;
+    }
+
+    .logo {
+      text-align: center;
+    }
+
+    .logo h1 {
+      font-size: 3rem;
+      font-weight: 800;
+      letter-spacing: -2px;
+      background: linear-gradient(135deg, var(--accent), var(--accent-hover));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .logo p {
+      color: var(--muted);
+      font-size: 0.9rem;
+      margin-top: 0.3rem;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 2rem;
+      width: 100%;
+      max-width: 560px;
+    }
+
+    form {
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+
+    input[type="url"] {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-size: 0.95rem;
+      padding: 0.75rem 1rem;
+      outline: none;
+      transition: border-color 0.15s;
+      width: 100%;
+    }
+
+    input[type="url"]:focus {
+      border-color: var(--accent);
+    }
+
+    input[type="url"]::placeholder {
+      color: var(--muted);
+    }
+
+    button {
+      background: var(--accent);
+      border: none;
+      border-radius: var(--radius);
+      color: #fff;
+      cursor: pointer;
+      font-size: 0.95rem;
+      font-weight: 600;
+      padding: 0.75rem 1.5rem;
+      transition: background 0.15s, transform 0.1s;
+    }
+
+    button:hover {
+      background: var(--accent-hover);
+    }
+
+    button:active {
+      transform: scale(0.98);
+    }
+
+    .bookmarklet {
+      margin-top: 1.5rem;
+      padding-top: 1.5rem;
+      border-top: 1px solid var(--border);
+    }
+
+    .bookmarklet p {
+      color: var(--muted);
+      font-size: 0.8rem;
+      margin-bottom: 0.6rem;
+    }
+
+    .bookmarklet a {
+      background: var(--border);
+      border-radius: 6px;
+      color: var(--accent-hover);
+      cursor: grab;
+      display: inline-block;
+      font-size: 0.8rem;
+      font-weight: 600;
+      padding: 0.35rem 0.75rem;
+      text-decoration: none;
+      border: 1px dashed var(--muted);
+      transition: border-color 0.15s;
+    }
+
+    .bookmarklet a:hover {
+      border-color: var(--accent);
+    }
+
+    footer {
+      color: var(--muted);
+      font-size: 0.75rem;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="logo">
+    <h1>67ft</h1>
+  </div>
+
+  <div class="card">
+    <form id="proxy-form">
+      <input type="url" id="url-input" name="url" placeholder="https://example.com/article" autocomplete="off"
+        spellcheck="false" required>
+      <button type="submit">Read Article →</button>
+    </form>
+
+    <div class="bookmarklet">
+      <p>Drag this to your bookmarks bar for one-click access:</p>
+      <a id="bookmarklet-link" href="#">📖 67ft-ize</a>
+    </div>
+  </div>
+
+  <footer>pretending to be googlebot since 2026</footer>
+
+  <script>
+    // Set bookmarklet href dynamically so it always points to this server
+    const origin = window.location.origin;
+    document.getElementById('bookmarklet-link').href =
+      `javascript:(function(){window.location.href='${origin}/'+encodeURIComponent(window.location.href);})();`;
+
+    document.getElementById('proxy-form').addEventListener('submit', function (e) {
+      e.preventDefault();
+      const url = document.getElementById('url-input').value.trim();
+      if (url) {
+        window.location.href = '/' + encodeURIComponent(url);
+      }
+    });
+  </script>
+</body>
+
+</html>
