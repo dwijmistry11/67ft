@@ -146,42 +146,35 @@ async fn raw_handler(
     }
 }
 
-/// Decode a URL that may be percent-encoded, and reconstruct http:// or https:// prefix
+/// Normalise the target URL captured by the `/*url` wildcard.
+///
+/// Axum's `Path` extractor has already percent-decoded the segment, so the
+/// value arrives ready to use. Decoding it a second time here corrupted any
+/// URL containing a literal percent sign, turning `%2525` into `%` instead
+/// of `%25`, and mangled non-ASCII bytes into Latin-1 characters.
 fn decode_url(raw: &str) -> String {
-    // The router gives us the path segment after the leading slash.
-    // URLs might come in as:
-    //   https%3A%2F%2Fexample.com  (percent-encoded by bookmarklet)
-    //   https://example.com        (typed directly)
-    let decoded = percent_decode(raw);
-
-    // Axum strips the leading slash from the path wildcard,
-    // but the scheme's // might have been collapsed. Normalise it.
-    if decoded.starts_with("https:/") && !decoded.starts_with("https://") {
-        decoded.replacen("https:/", "https://", 1)
-    } else if decoded.starts_with("http:/") && !decoded.starts_with("http://") {
-        decoded.replacen("http:/", "http://", 1)
+    // Browsers and proxies sometimes collapse the "//" after the scheme.
+    if raw.starts_with("https:/") && !raw.starts_with("https://") {
+        raw.replacen("https:/", "https://", 1)
+    } else if raw.starts_with("http:/") && !raw.starts_with("http://") {
+        raw.replacen("http:/", "http://", 1)
     } else {
-        decoded
+        raw.to_string()
     }
 }
 
-/// Minimal percent-decode (handles %XX sequences)
-fn percent_decode(s: &str) -> String {
+/// Escape text for safe interpolation into HTML.
+fn escape_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
-                if let Ok(b) = u8::from_str_radix(hex, 16) {
-                    out.push(b as char);
-                    i += 3;
-                    continue;
-                }
-            }
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
         }
-        out.push(bytes[i] as char);
-        i += 1;
     }
     out
 }
@@ -202,7 +195,7 @@ a{{color:#7c6af7}}
 <p><a href="/">&larr; Try another URL</a></p>
 <p style="font-size:0.75rem;color:#444">{url}</p>
 </body></html>"#,
-        url = url,
-        reason = reason,
+        url = escape_html(url),
+        reason = escape_html(reason),
     ))
 }

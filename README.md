@@ -28,6 +28,7 @@ cargo build --release
   -p, --port <PORT>          Port to listen on  [env: PORT]  [default: 8080]
       --host <HOST>          Bind address       [env: HOST]  [default: 0.0.0.0]
   -u, --user-agent <UA>      Override User-Agent
+      --x-forwarded-for <IP> Spoofed client IP  [default: 66.249.66.1]
       --timeout <SECS>       Request timeout    [default: 30]
 ```
 
@@ -55,10 +56,20 @@ javascript:(function(){window.location.href='http://localhost:8080/'+encodeURICo
 ## How it works
 
 - Sends requests with `User-Agent: Googlebot` and `X-Forwarded-For: 66.249.66.1`
+- **Removes all `<script>` elements**, producing a static reader view. Publishers
+  ship single-page apps that re-render from their own router and API state; left
+  in place, that JavaScript discards the server-rendered article and shows its
+  own 404 or paywall
+- Unwraps `<noscript>` so lazy-loaded images become real images
 - Injects `<base href="...">` so relative resources (CSS, images) load directly from origin
 - Rewrites `<a href>` links to stay proxied through 67ft
 - Strips CSP / X-Frame-Options headers that would block rendering
-- Injects a JS snippet to neutralise common paywall globals (Piano SDK, metered counters, etc.)
+
+Because scripts are removed, interactive features such as comments, embedded
+players and infinite scroll will not work. That is the trade for reliable text.
+
+Note that major publishers verify crawlers by reverse DNS on the source IP, so a
+forged user agent alone will not pass on every site.
 
 ## Run as a systemd service (Pi / Linux)
 
