@@ -3,7 +3,9 @@ use axum::{
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tracing::debug;
 
 use crate::AppState;
@@ -16,7 +18,6 @@ const STRIP_RESPONSE_HEADERS: &[&str] = &[
     "x-frame-options",
     "x-xss-protection",
     "strict-transport-security",
-    "x-content-type-options",
     "x-robots-tag",
     "report-to",
     "nel",
@@ -31,6 +32,101 @@ const STRIP_RESPONSE_HEADERS: &[&str] = &[
 
 /// Maximum redirect hops we will follow ourselves.
 const MAX_REDIRECTS: usize = 10;
+
+/// A response we are willing to serve again without refetching.
+#[derive(Clone)]
+pub struct CachedPage {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Vec<u8>,
+}
+
+struct Entry {
+    page: CachedPage,
+    stored: Instant,
+}
+
+/// A small in-memory page cache, bounded by both age and total bytes.
+///
+/// Re-reading an article, or following a link and going back, previously
+/// refetched and re-rewrote the whole page every time.
+pub struct Cache {
+    entries: Mutex<HashMap<String, Entry>>,
+    ttl: Duration,
+    max_bytes: usize,
+}
+
+impl Cache {
+    pub fn new(ttl_secs: u64, max_mb: usize) -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            ttl: Duration::from_secs(ttl_secs),
+            max_bytes: max_mb.saturating_mul(1024 * 1024),
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        !self.ttl.is_zero() && self.max_bytes > 0
+    }
+
+    fn get(&self, key: &str) -> Option<CachedPage> {
+        if !self.enabled() {
+            return None;
+        }
+        let mut entries = self.entries.lock().ok()?;
+        match entries.get(key) {
+            Some(e) if e.stored.elapsed() < self.ttl => Some(e.page.clone()),
+            Some(_) => {
+                entries.remove(key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn put(&self, key: String, page: CachedPage) {
+        if !self.enabled() || page.body.len() > self.max_bytes {
+            return;
+        }
+        let Ok(mut entries) = self.entries.lock() else {
+            return;
+        };
+
+        entries.retain(|_, e| e.stored.elapsed() < self.ttl);
+
+        // Evict oldest first until the new entry fits in the budget.
+        let mut used: usize = entries.values().map(|e| e.page.body.len()).sum();
+        while used + page.body.len() > self.max_bytes {
+            let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, e)| e.stored)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            if let Some(removed) = entries.remove(&oldest) {
+                used = used.saturating_sub(removed.page.body.len());
+            }
+        }
+
+        entries.insert(key, Entry { page, stored: Instant::now() });
+    }
+}
+
+/// Build an axum response from a page, cached or fresh.
+fn build_response(page: &CachedPage, cache_hit: bool) -> Response {
+    let mut builder = Response::builder().status(page.status);
+    let headers = builder.headers_mut().unwrap();
+    headers.clone_from(&page.headers);
+    headers.insert(
+        "x-67ft-cache",
+        HeaderValue::from_static(if cache_hit { "hit" } else { "miss" }),
+    );
+    builder
+        .body(Body::from(page.body.clone()))
+        .unwrap()
+        .into_response()
+}
 
 /// True if an address must never be reached through the proxy.
 ///
@@ -53,52 +149,117 @@ fn is_blocked_ip(ip: &std::net::IpAddr) -> bool {
                 || o[0] == 0                              // 0.0.0.0/8
                 || (o[0] == 100 && (o[1] & 0xc0) == 64)   // 100.64.0.0/10 CGNAT
                 || o[0] >= 240                            // 240.0.0.0/4 reserved
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0)     // 192.0.0.0/24 IETF
+                || (o[0] == 192 && o[1] == 88 && o[2] == 99)   // 192.88.99.0/24 6to4 relay
+                || (o[0] == 198 && (o[1] & 0xfe) == 18)        // 198.18.0.0/15 benchmarking
         }
         IpAddr::V6(v6) => {
             let seg = v6.segments();
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || (seg[0] & 0xfe00) == 0xfc00 // fc00::/7 unique local
-                || (seg[0] & 0xffc0) == 0xfe80 // fe80::/10 link local
-                || v6
-                    .to_ipv4_mapped()
-                    .is_some_and(|v4| is_blocked_ip(&IpAddr::V4(v4)))
+            if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
+                return true;
+            }
+            if (seg[0] & 0xfe00) == 0xfc00      // fc00::/7  unique local
+                || (seg[0] & 0xffc0) == 0xfe80  // fe80::/10 link local
+                || (seg[0] & 0xffc0) == 0xfec0  // fec0::/10 site local (deprecated)
+                || seg[0] == 0x2001 && seg[1] == 0x0db8 // 2001:db8::/32 documentation
+                || (seg[0] & 0xff00) == 0x0100  // 100::/8   discard-only
+            {
+                return true;
+            }
+            // Any address that embeds an IPv4 address must be judged on that
+            // address: ::a.b.c.d, ::ffff:a.b.c.d, NAT64 and 6to4 all reach v4.
+            if let Some(v4) = embedded_ipv4(v6) {
+                return is_blocked_ip(&IpAddr::V4(v4));
+            }
+            false
         }
     }
 }
 
-/// Split "scheme://host:port/path" into a host and a port.
-fn split_host_port(url: &str) -> Option<(String, u16)> {
-    let after_scheme = url.find("://")?;
-    let scheme = &url[..after_scheme];
-    let rest = &url[after_scheme + 3..];
-    let authority_end = rest
-        .find(['/', '?', '#'])
-        .unwrap_or(rest.len());
-    let mut authority = &rest[..authority_end];
+/// Pull an IPv4 address out of the IPv6 forms that route to one.
+fn embedded_ipv4(v6: &std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
+    let seg = v6.segments();
+    let o = v6.octets();
 
-    // Strip any userinfo, which is not part of the host.
-    if let Some(at) = authority.rfind('@') {
-        authority = &authority[at + 1..];
+    // ::ffff:a.b.c.d (mapped) and ::a.b.c.d (compatible)
+    if seg[0..5] == [0, 0, 0, 0, 0] && (seg[5] == 0xffff || seg[5] == 0) {
+        let v4 = std::net::Ipv4Addr::new(o[12], o[13], o[14], o[15]);
+        if !v4.is_unspecified() {
+            return Some(v4);
+        }
     }
-
-    let default_port = if scheme.eq_ignore_ascii_case("https") { 443 } else { 80 };
-
-    // IPv6 literals are bracketed: [::1]:8080
-    if let Some(close) = authority.find(']') {
-        let host = authority.get(1..close)?.to_string();
-        let port = authority[close + 1..]
-            .strip_prefix(':')
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(default_port);
-        return Some((host, port));
+    // ::ffff:0:a.b.c.d (translated)
+    if seg[0..4] == [0, 0, 0, 0] && seg[4] == 0xffff && seg[5] == 0 {
+        return Some(std::net::Ipv4Addr::new(o[12], o[13], o[14], o[15]));
     }
-
-    match authority.rsplit_once(':') {
-        Some((h, p)) => Some((h.to_string(), p.parse().unwrap_or(default_port))),
-        None => Some((authority.to_string(), default_port)),
+    // 64:ff9b::/96 and 64:ff9b:1::/48 NAT64
+    if seg[0] == 0x0064 && seg[1] == 0xff9b {
+        return Some(std::net::Ipv4Addr::new(o[12], o[13], o[14], o[15]));
     }
+    // 2002:a.b.c.d::/16 6to4
+    if seg[0] == 0x2002 {
+        return Some(std::net::Ipv4Addr::new(o[2], o[3], o[4], o[5]));
+    }
+    None
+}
+
+/// A DNS resolver that refuses to return non-public addresses.
+///
+/// `ensure_public_host` checks before the request is made, but reqwest would
+/// then resolve the name again independently, leaving a window in which a
+/// hostile domain can answer with a private address the second time (DNS
+/// rebinding). reqwest dials exactly the addresses this returns, so filtering
+/// here closes that window.
+pub struct GuardedResolver {
+    allow_private: bool,
+}
+
+impl GuardedResolver {
+    pub fn new(allow_private: bool) -> Self {
+        Self { allow_private }
+    }
+}
+
+impl reqwest::dns::Resolve for GuardedResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let allow_private = self.allow_private;
+        let host = name.as_str().to_string();
+
+        Box::pin(async move {
+            let resolved: Vec<std::net::SocketAddr> =
+                tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+
+            let addrs: Vec<std::net::SocketAddr> = if allow_private {
+                resolved
+            } else {
+                resolved
+                    .into_iter()
+                    .filter(|a| !is_blocked_ip(&a.ip()))
+                    .collect()
+            };
+
+            if addrs.is_empty() {
+                return Err(format!("{host} has no public address").into());
+            }
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// The host and port a URL will actually be dialled on.
+///
+/// This uses the same parser reqwest does. Hand-rolled parsing disagreed with
+/// it on inputs such as `http://127.0.0.1\\@evil.example.com/`, where the
+/// spec treats the backslash as ending the authority: the guard checked
+/// `evil.example.com` while the request went to loopback.
+fn split_host_port(raw: &str) -> Option<(String, u16)> {
+    let parsed = url::Url::parse(raw).ok()?;
+    let host = match parsed.host()? {
+        url::Host::Domain(d) => d.to_string(),
+        url::Host::Ipv4(a) => a.to_string(),
+        url::Host::Ipv6(a) => a.to_string(),
+    };
+    Some((host, parsed.port_or_known_default()?))
 }
 
 /// Resolve a target host and refuse anything that points inside the network.
@@ -131,24 +292,32 @@ async fn ensure_public_host(url: &str) -> Result<(), FetchError> {
 
 /// Resolve a Location header against the URL it came from.
 fn resolve_redirect(base: &str, location: &str) -> String {
-    if location.starts_with("http://") || location.starts_with("https://") {
-        return location.to_string();
+    let loc = location.trim();
+    if loc.is_empty() {
+        return base.to_string();
     }
-    let origin = extract_origin(base);
-    if let Some(rest) = location.strip_prefix("//") {
-        let scheme = origin.split(':').next().unwrap_or("https");
+
+    // Scheme-relative: //host/path
+    if let Some(rest) = loc.strip_prefix("//") {
+        let scheme = base.split(':').next().unwrap_or("https");
         return format!("{scheme}://{rest}");
     }
-    if location.starts_with('/') {
-        return format!("{origin}{location}");
+    // Absolute, and the scheme test must be case-insensitive.
+    if has_http_scheme(loc) {
+        return loc.to_string();
     }
-    // Relative to the current directory.
-    let path_start = base.find("://").map(|i| i + 3).unwrap_or(0);
-    let dir_end = base[path_start..]
-        .rfind('/')
-        .map(|i| path_start + i + 1)
-        .unwrap_or(base.len());
-    format!("{}{}", &base[..dir_end], location)
+
+    let origin = extract_origin(base);
+    if loc.starts_with('/') {
+        return format!("{origin}{loc}");
+    }
+    // A bare query or fragment keeps the current path.
+    if loc.starts_with('?') || loc.starts_with('#') {
+        let path_only = base.split(['?', '#']).next().unwrap_or(base);
+        return format!("{path_only}{loc}");
+    }
+    // Relative to the current directory, with "." and ".." resolved.
+    resolve_relative(&document_base(base), loc)
 }
 
 /// Read a response body, refusing anything over `max_bytes`.
@@ -236,6 +405,12 @@ pub async fn fetch_and_rewrite(
     url: &str,
     raw: bool,
 ) -> Result<Response, FetchError> {
+    let cache_key = if raw { format!("raw:{url}") } else { url.to_string() };
+    if let Some(page) = state.cache.get(&cache_key) {
+        debug!("cache hit: {url}");
+        return Ok(build_response(&page, true));
+    }
+
     // `final_url` is the URL after redirects, which is what relative links and
     // the injected <base> must resolve against.
     let (response, final_url) = fetch_guarded(state, url).await?;
@@ -251,75 +426,173 @@ pub async fn fetch_and_rewrite(
         .to_string();
 
     // For non-HTML content (images, CSS, fonts etc.), just stream it through as-is.
-    let is_html = content_type.contains("text/html");
+    let is_html = content_type.contains("text/html")
+        || content_type.contains("application/xhtml+xml");
     let max_bytes = state.config.max_body_mb.saturating_mul(1024 * 1024);
 
     if !is_html || raw {
         let body_bytes = read_body_capped(response, max_bytes).await?;
 
-        let mut builder = Response::builder().status(status_convert(status));
-
-        let headers = builder.headers_mut().unwrap();
-        forward_headers(&upstream_headers, headers);
-
+        let mut headers = HeaderMap::new();
+        forward_headers(&upstream_headers, &mut headers);
         headers.insert(
             "content-type",
             HeaderValue::from_str(&content_type)
                 .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
         );
 
-        return Ok(builder
-            .body(Body::from(body_bytes))
-            .unwrap()
-            .into_response());
+        let page = CachedPage {
+            status: status_convert(status),
+            headers,
+            body: body_bytes,
+        };
+        if page.status.is_success() {
+            state.cache.put(cache_key, page.clone());
+        }
+        return Ok(build_response(&page, false));
     }
 
     // --- HTML path ---
     let html_bytes = read_body_capped(response, max_bytes).await?;
 
-    let html = String::from_utf8_lossy(&html_bytes).into_owned();
+    let html = decode_html(&html_bytes, &content_type);
     let rewritten = rewrite_html(&html, &final_url);
 
-    let mut builder = Response::builder()
-        .status(status_convert(status))
-        .header("content-type", "text/html; charset=utf-8");
+    let mut headers = HeaderMap::new();
+    forward_headers(&upstream_headers, &mut headers);
+    // Set this AFTER forwarding: the upstream content-type names the source
+    // charset, but we have transcoded the body to UTF-8, so forwarding it
+    // would label the response with an encoding it no longer uses.
+    headers.insert(
+        "content-type",
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
 
-    let headers = builder.headers_mut().unwrap();
-    forward_headers(&upstream_headers, headers);
-
-    Ok(builder
-        .body(Body::from(rewritten))
-        .unwrap()
-        .into_response())
+    let page = CachedPage {
+        status: status_convert(status),
+        headers,
+        body: rewritten.into_bytes(),
+    };
+    if page.status.is_success() {
+        state.cache.put(cache_key, page.clone());
+    }
+    Ok(build_response(&page, false))
 }
 
-/// Rewrite HTML into a static reader view:
-/// 1. Drop any existing <base> tag.
-/// 2. Remove all <script> elements. Modern publishers ship a single-page app
-///    that re-renders from its own router and API state; left in place it
-///    discards the server-rendered article and shows its own 404.
-/// 3. Unwrap <noscript> so lazy-loaded images become real images.
-/// 4. Rewrite <a href> so navigation stays proxied.
-/// 5. Inject <base href> last, so the link rewriter cannot mangle it.
-fn rewrite_html(html: &str, original_url: &str) -> String {
-    let origin = extract_origin(original_url);
+/// Decode a response body to UTF-8 using the charset the page declares.
+///
+/// `String::from_utf8_lossy` alone replaced every non-ASCII byte of a
+/// legacy-encoded page with U+FFFD.
+fn decode_html(bytes: &[u8], content_type: &str) -> String {
+    let label = charset_from_content_type(content_type)
+        .or_else(|| charset_from_meta(bytes))
+        .unwrap_or_else(|| "utf-8".to_string());
 
-    let html = remove_existing_base(html);
-    let html = strip_scripts(&html);
-    let html = unwrap_noscript(&html);
-    let html = rewrite_anchor_hrefs(&html, &origin);
+    let encoding = encoding_rs::Encoding::for_label(label.as_bytes())
+        .unwrap_or(encoding_rs::UTF_8);
+    let (decoded, _, _) = encoding.decode(bytes);
+    decoded.into_owned()
+}
 
-    let base_tag = format!(r#"<base href="{origin}/">"#);
-    inject_after_head(&html, &base_tag)
+/// Pull `charset=` out of a Content-Type header value.
+fn charset_from_content_type(content_type: &str) -> Option<String> {
+    let pos = find_ci(content_type, "charset=")?;
+    let raw = content_type[pos + 8..].trim();
+    let value = raw
+        .split(';')
+        .next()?
+        .trim()
+        .trim_matches(['"', '\''].as_slice());
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+/// Look for a <meta charset> declaration near the top of the document.
+///
+/// Only the first 2 KiB are inspected, which is where the spec requires the
+/// declaration to appear.
+fn charset_from_meta(bytes: &[u8]) -> Option<String> {
+    let head = &bytes[..bytes.len().min(2048)];
+    let text = String::from_utf8_lossy(head);
+    let mut rest: &str = &text;
+
+    while let Some(pos) = find_ci(rest, "<meta") {
+        let after = &rest[pos..];
+        let end = after.find('>').unwrap_or(after.len());
+        let tag = &after[..end];
+
+        // <meta charset="utf-8">
+        if let Some(c) = find_ci(tag, "charset") {
+            let tail = tag[c + 7..].trim_start();
+            if let Some(tail) = tail.strip_prefix('=') {
+                let v = tail.trim().trim_matches(['"', '\''].as_slice());
+                let v: String = v
+                    .chars()
+                    .take_while(|c| !c.is_whitespace() && *c != '/' && *c != '>')
+                    .collect();
+                if !v.is_empty() {
+                    return Some(v);
+                }
+            }
+        }
+        rest = &after[end.min(after.len())..];
+        if rest.is_empty() {
+            break;
+        }
+        rest = &rest[1.min(rest.len())..];
+    }
+    None
+}
+
+/// The directory a document's relative URLs resolve against, with a trailing
+/// slash. "https://e.com/blog/post/page?x=1" becomes "https://e.com/blog/post/".
+fn document_base(url: &str) -> String {
+    let no_frag = url.split(['?', '#']).next().unwrap_or(url);
+    let origin = extract_origin(no_frag);
+    let path = match no_frag.find("://") {
+        Some(i) => {
+            let rest = &no_frag[i + 3..];
+            match rest.find('/') {
+                Some(p) => &rest[p..],
+                None => "/",
+            }
+        }
+        None => "/",
+    };
+    let dir = match path.rfind('/') {
+        Some(p) => &path[..p + 1],
+        None => "/",
+    };
+    format!("{origin}{dir}")
+}
+
+/// Join a relative reference onto a base directory, resolving "." and "..".
+fn resolve_relative(base_dir: &str, rel: &str) -> String {
+    let origin = extract_origin(base_dir);
+    let base_path = &base_dir[origin.len()..];
+
+    let joined = format!("{base_path}{rel}");
+    let mut out: Vec<&str> = Vec::new();
+    for segment in joined.split('/') {
+        match segment {
+            "." => {}
+            ".." => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    let path = out.join("/");
+    if path.starts_with('/') {
+        format!("{origin}{path}")
+    } else {
+        format!("{origin}/{path}")
+    }
 }
 
 /// ASCII case-insensitive substring search, returning a byte index into `hay`.
 ///
 /// Needles are always ASCII, and an ASCII byte can never appear inside a
-/// multi-byte UTF-8 sequence, so a hit is always on a char boundary. This
-/// replaces the previous `to_lowercase()` approach, which allocated a copy of
-/// the document per call and produced indices that did not line up with the
-/// original whenever lowercasing changed a character's byte length.
+/// multi-byte UTF-8 sequence, so a hit is always on a char boundary.
 fn find_ci(hay: &str, needle_lower: &str) -> Option<usize> {
     let h = hay.as_bytes();
     let n = needle_lower.as_bytes();
@@ -329,179 +602,282 @@ fn find_ci(hay: &str, needle_lower: &str) -> Option<usize> {
     h.windows(n.len()).position(|w| w.eq_ignore_ascii_case(n))
 }
 
-/// True if the byte after a tag name ends the name (whitespace, '>' or '/').
-fn is_tag_name_end(b: Option<&u8>) -> bool {
-    matches!(b, Some(c) if c.is_ascii_whitespace() || *c == b'>' || *c == b'/')
-}
-
-/// Extract scheme + host from a URL, e.g. "https://www.nytimes.com"
+/// Extract scheme + host from a URL, e.g. "https://www.nytimes.com".
+///
+/// The authority ends at the first '/', '?' or '#', and any userinfo is
+/// dropped so credentials never reach the rewritten page.
 fn extract_origin(url: &str) -> String {
-    if let Some(after_scheme) = url.find("://") {
-        let rest = &url[after_scheme + 3..];
-        let host_end = rest.find('/').unwrap_or(rest.len());
-        let host = &rest[..host_end];
-        let scheme = &url[..after_scheme];
-        return format!("{scheme}://{host}");
+    let Some(after_scheme) = url.find("://") else {
+        return url.to_string();
+    };
+    let scheme = &url[..after_scheme];
+    let rest = &url[after_scheme + 3..];
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let mut authority = &rest[..end];
+    if let Some(at) = authority.rfind('@') {
+        authority = &authority[at + 1..];
     }
-    url.to_string()
+    format!("{scheme}://{authority}")
 }
 
-/// Remove existing <base ...> tags
-fn remove_existing_base(html: &str) -> String {
-    let mut result = String::with_capacity(html.len());
-    let mut rest = html;
+/// Elements whose contents are raw text rather than markup. Copied through
+/// untouched, so a "<script" written inside a <textarea> is not taken for a tag.
+const RAW_TEXT_ELEMENTS: [&str; 3] = ["style", "textarea", "title"];
 
-    while let Some(start) = find_ci(rest, "<base") {
-        let after = &rest[start..];
-        if !is_tag_name_end(after.as_bytes().get(5)) {
-            // e.g. "<basefont" — not a <base> tag, emit and continue past it.
-            result.push_str(&rest[..start + 5]);
-            rest = &rest[start + 5..];
-            continue;
+/// Rewrite HTML into a static reader view.
+///
+/// One pass handles everything: scripts are dropped, <base> removed,
+/// <noscript> unwrapped, and <a>/<form> targets proxied. Earlier versions ran a
+/// separate substring scan per concern, which mis-read comments and attribute
+/// values as markup and was quadratic on some inputs.
+fn rewrite_html(html: &str, original_url: &str) -> String {
+    let base = document_base(original_url);
+    let (body, head_end) = transform(html, &base);
+    let base_tag = format!(r#"<base href="{base}">"#);
+
+    match head_end {
+        Some(at) => {
+            let mut out = String::with_capacity(body.len() + base_tag.len() + 1);
+            out.push_str(&body[..at]);
+            out.push('\n');
+            out.push_str(&base_tag);
+            out.push_str(&body[at..]);
+            out
         }
-        result.push_str(&rest[..start]);
-        match after.find('>') {
-            Some(end) => rest = &after[end + 1..],
-            None => return result, // unterminated tag: drop the remainder
-        }
+        None => format!("{base_tag}\n{body}"),
     }
-    result.push_str(rest);
-    result
 }
 
-/// Remove every <script> element, opening tag, contents and closing tag.
-fn strip_scripts(html: &str) -> String {
-    let mut out = String::with_capacity(html.len());
-    let mut rest = html;
+/// Single linear pass over the document.
+///
+/// Returns the rewritten HTML and the offset just past the opening <head> tag,
+/// which is where the caller injects the base tag.
+fn transform(html: &str, base: &str) -> (String, Option<usize>) {
+    let mut out = String::with_capacity(html.len() + 256);
+    let mut head_end: Option<usize> = None;
+    let bytes = html.as_bytes();
+    let mut i = 0;
 
-    while let Some(start) = find_ci(rest, "<script") {
-        let after = &rest[start..];
-        if !is_tag_name_end(after.as_bytes().get(7)) {
-            out.push_str(&rest[..start + 7]);
-            rest = &rest[start + 7..];
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            let start = i;
+            while i < bytes.len() && bytes[i] != b'<' {
+                i += 1;
+            }
+            out.push_str(&html[start..i]);
             continue;
         }
-        out.push_str(&rest[..start]);
 
-        let Some(gt) = after.find('>') else {
-            return out; // unterminated opening tag: drop the remainder
+        let rest = &html[i..];
+
+        // Comments are data, not markup: copy them verbatim. Treating a
+        // "<script" or "<base" inside one as a tag used to eat the "-->" and
+        // swallow the rest of the page.
+        if rest.starts_with("<!--") {
+            let end = rest.find("-->").map(|e| e + 3).unwrap_or(rest.len());
+            out.push_str(&rest[..end]);
+            i += end;
+            continue;
+        }
+        // Doctype, CDATA and processing instructions.
+        if rest.starts_with("<!") || rest.starts_with("<?") {
+            let end = rest.find('>').map(|e| e + 1).unwrap_or(rest.len());
+            out.push_str(&rest[..end]);
+            i += end;
+            continue;
+        }
+
+        let Some(tag) = parse_tag(rest) else {
+            // A stray '<' that does not begin a tag.
+            out.push('<');
+            i += 1;
+            continue;
         };
 
-        // Self-closing <script ... /> has no body to skip.
-        if after[..gt].ends_with('/') {
-            rest = &after[gt + 1..];
-            continue;
-        }
+        let raw = &rest[..tag.end];
+        match tag.name.as_str() {
+            // Drop the element and everything it contains.
+            "script" => {
+                i += tag.end + skip_raw_text(&rest[tag.end..], "script").1;
+            }
+            // Drop the tag, keep the contents.
+            "base" | "noscript" | "/noscript" => {
+                i += tag.end;
+            }
+            "a" => {
+                out.push_str(&rewrite_tag_attr(raw, "href", base));
+                i += tag.end;
+            }
+            "form" => {
+                out.push_str(&rewrite_tag_attr(raw, "action", base));
+                i += tag.end;
+            }
+            name => {
+                out.push_str(raw);
+                i += tag.end;
 
-        let body = &after[gt + 1..];
-        match find_ci(body, "</script") {
-            Some(close) => {
-                let tail = &body[close..];
-                match tail.find('>') {
-                    Some(e) => rest = &tail[e + 1..],
-                    None => return out,
+                if name == "head" && head_end.is_none() {
+                    head_end = Some(out.len());
+                } else if RAW_TEXT_ELEMENTS.contains(&name) {
+                    let (text, consumed) = skip_raw_text(&rest[tag.end..], name);
+                    out.push_str(text);
+                    i += consumed;
                 }
             }
-            // No closing tag: the rest of the document is script content.
-            None => return out,
         }
     }
-    out.push_str(rest);
-    out
+    (out, head_end)
 }
 
-/// Strip <noscript> and </noscript> tags while keeping their contents.
-/// Publishers put the real <img> for lazy-loaded media inside <noscript>,
-/// so unwrapping restores images now that no script runs.
-fn unwrap_noscript(html: &str) -> String {
-    let mut out = String::with_capacity(html.len());
-    let mut rest = html;
-
-    loop {
-        let open = find_ci(rest, "<noscript");
-        let close = find_ci(rest, "</noscript");
-        let (start, name_len) = match (open, close) {
-            (Some(o), Some(c)) if o < c => (o, 9),
-            (Some(o), None) => (o, 9),
-            (_, Some(c)) => (c, 10),
-            (None, None) => break,
-        };
-
-        let after = &rest[start..];
-        if !is_tag_name_end(after.as_bytes().get(name_len)) {
-            out.push_str(&rest[..start + name_len]);
-            rest = &rest[start + name_len..];
-            continue;
-        }
-        out.push_str(&rest[..start]);
-        match after.find('>') {
-            Some(end) => rest = &after[end + 1..],
-            None => return out,
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
-/// Rewrite href on <a> tags only, so same-origin navigation stays proxied.
+/// Find the end of a raw-text element's contents.
 ///
-/// Previously this matched any `href=` in the document, which sent every
-/// stylesheet and preload through the proxy and rewrote our own <base> tag.
-fn rewrite_anchor_hrefs(html: &str, origin: &str) -> String {
-    let mut out = String::with_capacity(html.len() + 512);
-    let mut rest = html;
-
-    while let Some(start) = find_ci(rest, "<a") {
-        let after = &rest[start..];
-        // Only an "<a" followed by whitespace is an anchor tag; "<article" is not.
-        if !matches!(after.as_bytes().get(2), Some(c) if c.is_ascii_whitespace()) {
-            out.push_str(&rest[..start + 2]);
-            rest = &rest[start + 2..];
-            continue;
+/// Returns the contents including the closing tag, and how many bytes of
+/// `after_open` they occupy. With no closing tag the rest of the input is
+/// content, which is what the HTML parsing rules say.
+fn skip_raw_text<'a>(after_open: &'a str, name: &str) -> (&'a str, usize) {
+    let close = format!("</{name}");
+    match find_ci(after_open, &close) {
+        Some(pos) => {
+            let tail = &after_open[pos..];
+            let end = tail.find('>').map(|e| pos + e + 1).unwrap_or(after_open.len());
+            (&after_open[..end], end)
         }
-        let Some(gt) = after.find('>') else {
-            break;
-        };
-        out.push_str(&rest[..start]);
-        out.push_str(&rewrite_href_in_tag(&after[..=gt], origin));
-        rest = &after[gt + 1..];
+        None => (after_open, after_open.len()),
     }
-    out.push_str(rest);
-    out
 }
 
-/// Rewrite the href attribute inside a single opening tag.
-fn rewrite_href_in_tag(tag: &str, origin: &str) -> String {
-    let Some(hpos) = find_ci(tag, "href=") else {
-        return tag.to_string();
-    };
-    let after = &tag[hpos + 5..];
+/// A parsed opening or closing tag.
+struct Tag {
+    /// Lowercase name, prefixed with '/' for a closing tag.
+    name: String,
+    /// Byte offset just past the tag's '>'.
+    end: usize,
+}
 
-    let (quote, value_start) = match after.as_bytes().first() {
-        Some(b'"') => ('"', &after[1..]),
-        Some(b'\'') => ('\'', &after[1..]),
-        // Unquoted attribute value: leave the tag untouched rather than guess.
-        _ => return tag.to_string(),
-    };
+/// Parse a tag starting at the '<' of `s`, respecting quoted attribute values.
+///
+/// Returns None for a stray '<' or an unterminated tag, so the caller copies
+/// the text through rather than discarding it.
+fn parse_tag(s: &str) -> Option<Tag> {
+    let b = s.as_bytes();
+    if b.first() != Some(&b'<') {
+        return None;
+    }
+    let mut j = 1;
+    let closing = b.get(j) == Some(&b'/');
+    if closing {
+        j += 1;
+    }
+    let name_start = j;
+    while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'-') {
+        j += 1;
+    }
+    if j == name_start {
+        return None;
+    }
+    let mut name = String::with_capacity(j - name_start + 1);
+    if closing {
+        name.push('/');
+    }
+    name.push_str(&s[name_start..j].to_ascii_lowercase());
 
-    // An unterminated value used to index past the end of the string and panic.
-    let Some(end) = value_start.find(quote) else {
-        return tag.to_string();
-    };
+    // Scan to the '>' that actually ends the tag. A '>' inside a quoted
+    // attribute value does not end it.
+    let mut quote: Option<u8> = None;
+    while j < b.len() {
+        let c = b[j];
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == b'"' || c == b'\'' => quote = Some(c),
+            None if c == b'>' => return Some(Tag { name, end: j + 1 }),
+            None => {}
+        }
+        j += 1;
+    }
+    None
+}
 
-    let rewritten = rewrite_single_href(&value_start[..end], origin);
-    format!(
-        "{}href={}{}{}{}",
-        &tag[..hpos],
-        quote,
-        rewritten,
-        quote,
-        &value_start[end + 1..]
-    )
+/// Rewrite one URL-bearing attribute of a tag, matching the attribute name
+/// exactly so `data-href` is never mistaken for `href`.
+fn rewrite_tag_attr(tag: &str, attr: &str, base: &str) -> String {
+    let b = tag.as_bytes();
+    let mut j = 1;
+    if b.get(j) == Some(&b'/') {
+        j += 1;
+    }
+    while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'-') {
+        j += 1;
+    }
+
+    while j < b.len() && b[j] != b'>' {
+        while j < b.len() && (b[j].is_ascii_whitespace() || b[j] == b'/') {
+            j += 1;
+        }
+        if j >= b.len() || b[j] == b'>' {
+            break;
+        }
+
+        let name_start = j;
+        while j < b.len() && !b[j].is_ascii_whitespace() && b[j] != b'=' && b[j] != b'>' {
+            j += 1;
+        }
+        let name = &tag[name_start..j];
+
+        let mut k = j;
+        while k < b.len() && b[k].is_ascii_whitespace() {
+            k += 1;
+        }
+        if k >= b.len() || b[k] != b'=' {
+            // Valueless attribute.
+            j = k;
+            continue;
+        }
+        k += 1;
+        while k < b.len() && b[k].is_ascii_whitespace() {
+            k += 1;
+        }
+        if k >= b.len() {
+            break;
+        }
+
+        // Span of the value including any quotes.
+        let (outer_start, outer_end, inner_start, inner_end) =
+            if b[k] == b'"' || b[k] == b'\'' {
+                let q = b[k];
+                let inner = k + 1;
+                let mut e = inner;
+                while e < b.len() && b[e] != q {
+                    e += 1;
+                }
+                (k, (e + 1).min(b.len()), inner, e)
+            } else {
+                let inner = k;
+                let mut e = inner;
+                while e < b.len() && !b[e].is_ascii_whitespace() && b[e] != b'>' {
+                    e += 1;
+                }
+                (inner, e, inner, e)
+            };
+
+        if name.eq_ignore_ascii_case(attr) {
+            // HTML strips surrounding whitespace from a URL attribute.
+            let value = tag[inner_start..inner_end].trim();
+            let rewritten = rewrite_single_href(value, base);
+            return format!(
+                "{}\"{}\"{}",
+                &tag[..outer_start],
+                rewritten,
+                &tag[outer_end..]
+            );
+        }
+        j = outer_end;
+    }
+    tag.to_string()
 }
 
 /// Given a single href value, rewrite it to go through the proxy if it's navigable.
-fn rewrite_single_href(href: &str, origin: &str) -> String {
+fn rewrite_single_href(href: &str, base: &str) -> String {
     if href.is_empty()
         || href.starts_with('#')
         || href.starts_with("mailto:")
@@ -513,24 +889,33 @@ fn rewrite_single_href(href: &str, origin: &str) -> String {
         return href.to_string();
     }
 
-    // Absolute URL, same origin or not — keep it proxied.
-    if href.starts_with("http://") || href.starts_with("https://") {
-        return format!("/{}", encode_url(href));
-    }
-
     // Protocol-relative: //cdn.example.com/x inherits our scheme.
     if let Some(rest) = href.strip_prefix("//") {
-        let scheme = origin.split(':').next().unwrap_or("https");
+        let scheme = base.split(':').next().unwrap_or("https");
         return format!("/{}", encode_url(&format!("{scheme}://{rest}")));
+    }
+
+    // Absolute URL, same origin or not, keep it proxied.
+    if has_http_scheme(href) {
+        return format!("/{}", encode_url(href));
     }
 
     // Root-relative path like /article/foo
     if href.starts_with('/') {
+        let origin = extract_origin(base);
         return format!("/{}", encode_url(&format!("{origin}{href}")));
     }
 
-    // Relative path — the <base> tag handles these.
-    href.to_string()
+    // Relative path. The <base> tag resolves these to the origin, which for an
+    // anchor means navigating off the proxy and straight back into the
+    // paywall, so resolve and proxy it instead.
+    format!("/{}", encode_url(&resolve_relative(base, href)))
+}
+
+/// True if the reference begins with an http or https scheme, in any case.
+fn has_http_scheme(s: &str) -> bool {
+    let lower_prefix = s.get(..8).unwrap_or(s).to_ascii_lowercase();
+    lower_prefix.starts_with("http://") || lower_prefix.starts_with("https://")
 }
 
 /// Percent-encode a URL so it survives as a single path segment.
@@ -554,22 +939,6 @@ fn encode_url(url: &str) -> String {
         }
     }
     out
-}
-
-/// Inject a string immediately after the opening <head> tag (or prepend).
-fn inject_after_head(html: &str, injection: &str) -> String {
-    if let Some(head_pos) = find_ci(html, "<head") {
-        if let Some(close) = html[head_pos..].find('>') {
-            let insert_at = head_pos + close + 1;
-            let mut out = String::with_capacity(html.len() + injection.len() + 2);
-            out.push_str(&html[..insert_at]);
-            out.push('\n');
-            out.push_str(injection);
-            out.push_str(&html[insert_at..]);
-            return out;
-        }
-    }
-    format!("{injection}\n{html}")
 }
 
 /// Copy safe response headers from upstream to our response.
@@ -642,73 +1011,161 @@ impl std::fmt::Display for FetchError {
 mod tests {
     use super::*;
 
-    const ORIGIN: &str = "https://e.com";
+    const BASE: &str = "https://e.com/blog/post/";
 
-    #[test]
-    fn strips_scripts_including_unterminated() {
-        assert_eq!(strip_scripts("<p>a</p><script>x=1</script><p>b</p>"), "<p>a</p><p>b</p>");
-        assert_eq!(strip_scripts(r#"<script src="x.js"></script>ok"#), "ok");
-        assert_eq!(strip_scripts("<script type=module>let a='</p>'</script>hi"), "hi");
-        assert_eq!(strip_scripts("keep<scripting>this</scripting>"), "keep<scripting>this</scripting>");
-        assert_eq!(strip_scripts("a<script>oops"), "a");
+    fn rw(html: &str) -> String {
+        rewrite_html(html, "https://e.com/blog/post/page")
     }
 
     #[test]
-    fn unterminated_href_quote_does_not_panic() {
-        // This input used to panic with an out-of-bounds slice.
-        let out = rewrite_anchor_hrefs(r#"<a href="/foo"#, ORIGIN);
-        assert_eq!(out, r#"<a href="/foo"#);
+    fn strips_scripts() {
+        assert!(!rw("<p>a</p><script>x=1</script><p>b</p>").contains("x=1"));
+        assert!(rw("<p>a</p><script>x=1</script><p>b</p>").contains("<p>b</p>"));
+        // A '>' inside the script's own attributes must not end the tag early.
+        assert!(!rw(r#"<script data-x="a>b">bad()</script><p>keep</p>"#).contains("bad()"));
+        // Unquoted attribute ending in '/' is not a self-closing tag.
+        let out = rw("<p>a</p><script src=/j/>alert(1)</script><p>b</p>");
+        assert!(!out.contains("alert(1)"), "{out}");
+        assert!(!out.contains("</script>"), "{out}");
     }
 
     #[test]
-    fn only_anchors_are_rewritten() {
-        let html = r#"<link rel="stylesheet" href="/s.css"><a href="/art">x</a>"#;
-        let out = rewrite_anchor_hrefs(html, ORIGIN);
-        assert!(out.contains(r#"<link rel="stylesheet" href="/s.css">"#));
-        assert!(out.contains(r#"href="/https://e.com/art""#));
-        // <article> must not be mistaken for an anchor
-        assert_eq!(rewrite_anchor_hrefs("<article>x</article>", ORIGIN), "<article>x</article>");
+    fn comments_and_attributes_are_not_markup() {
+        // A "<script" inside a comment used to delete the rest of the document.
+        let out = rw("<p>before</p><!-- inline <script> blocks here --><p>after</p>");
+        assert!(out.contains("<p>after</p>"), "{out}");
+        let out = rw(r#"<p>before</p><div data-tpl="<script>"></div><p>after</p>"#);
+        assert!(out.contains("<p>after</p>"), "{out}");
+        // A "<base" inside a comment used to eat the comment's terminator.
+        let out = rw("<p>a</p><!-- the <base tag is injected --><p>b</p>");
+        assert!(out.contains("-->"), "{out}");
+        assert!(out.contains("<p>b</p>"), "{out}");
     }
 
     #[test]
-    fn base_tag_survives_link_rewriting() {
-        let html = r#"<html><head></head><body><a href="/a">x</a></body></html>"#;
-        let out = rewrite_html(html, "https://e.com/post/1");
-        assert!(out.contains(r#"<base href="https://e.com/">"#), "{out}");
+    fn raw_text_elements_are_left_alone() {
+        let out = rw("<textarea><script>x</script></textarea><p>after</p>");
+        assert!(out.contains("<script>x</script>"), "{out}");
+        assert!(out.contains("<p>after</p>"), "{out}");
     }
 
     #[test]
-    fn query_and_fragment_are_encoded() {
-        assert_eq!(
-            rewrite_single_href("/next?x=1&y=2#f", ORIGIN),
-            "/https://e.com/next%3Fx=1&y=2%23f"
-        );
-        assert_eq!(
-            rewrite_single_href("//cdn.e.com/x.js", ORIGIN),
-            "/https://cdn.e.com/x.js"
-        );
-        assert_eq!(rewrite_single_href("#top", ORIGIN), "#top");
-        assert_eq!(rewrite_single_href("rel/path", ORIGIN), "rel/path");
+    fn base_tag_is_the_document_directory() {
+        let out = rw("<html><head></head><body></body></html>");
+        assert!(out.contains(r#"<base href="https://e.com/blog/post/">"#), "{out}");
+        // Existing base tags are removed.
+        assert!(!rw(r#"<head><base href="/x"></head>"#).contains(r#"href="/x""#));
     }
 
     #[test]
-    fn lowercase_length_change_does_not_corrupt() {
-        // U+0130 is 2 bytes but lowercases to 3, which used to shift every
-        // index computed against a lowercased copy of the document.
-        let html = "<html><head>\u{130}\u{130}\u{130}<base href=\"/x\"></head><body>OK</body></html>";
-        let out = rewrite_html(html, "https://e.com/p");
-        assert!(out.contains("</head>"), "{out}");
-        assert!(out.contains("OK"), "{out}");
-        assert!(out.contains("\u{130}\u{130}\u{130}"), "{out}");
-        assert!(!out.contains(r#"href="/x""#), "{out}");
+    fn base_is_only_injected_after_a_real_head_tag() {
+        // "<head" inside a comment, and a <header> element, are not <head>.
+        let out = rw("<html><!-- <head> is next --><head><title>t</title></head><body>b</body>");
+        let comment_end = out.find("-->").unwrap();
+        let base_at = out.find("<base ").unwrap();
+        assert!(base_at > comment_end, "base injected inside the comment: {out}");
+        let out = rw("<html><body><header>hi</header></body></html>");
+        assert!(out.starts_with("<base "), "{out}");
+    }
+
+    #[test]
+    fn noscript_is_unwrapped() {
+        let out = rw("<noscript><img src=a></noscript>");
+        assert!(out.contains("<img src=a>"), "{out}");
+        assert!(!out.contains("noscript"), "{out}");
+    }
+
+    #[test]
+    fn anchors_are_rewritten_precisely() {
+        // exact attribute match: data-href must not be touched
+        let out = rewrite_tag_attr(r#"<a data-href="/track" href="/article">"#, "href", BASE);
+        assert!(out.contains(r#"data-href="/track""#), "{out}");
+        assert!(out.contains(r#"href="/https://e.com/article""#), "{out}");
+        // '>' inside another attribute
+        let out = rewrite_tag_attr(r#"<a title="a>b" href="/article">"#, "href", BASE);
+        assert!(out.contains(r#"href="/https://e.com/article""#), "{out}");
+        // unquoted value
+        let out = rewrite_tag_attr("<a href=/article>", "href", BASE);
+        assert!(out.contains(r#"href="/https://e.com/article""#), "{out}");
+        // leading whitespace, which HTML strips
+        let out = rewrite_tag_attr(r#"<a href=" /article">"#, "href", BASE);
+        assert!(out.contains(r#"href="/https://e.com/article""#), "{out}");
+    }
+
+    #[test]
+    fn relative_anchors_stay_proxied() {
+        let out = rw(r#"<a href="page2">x</a>"#);
+        assert!(out.contains(r#"href="/https://e.com/blog/post/page2""#), "{out}");
+    }
+
+    #[test]
+    fn form_actions_are_rewritten() {
+        let out = rw(r#"<form action="/search"><input name=q></form>"#);
+        assert!(out.contains(r#"action="/https://e.com/search""#), "{out}");
+    }
+
+    #[test]
+    fn unterminated_markup_is_not_discarded() {
+        // None of these may panic or silently drop the tail.
+        assert!(rw(r#"<p>keep</p><a href="/foo"#).contains("keep"));
+        assert!(rw("<p>keep</p><div attr='").contains("keep"));
+    }
+
+    #[test]
+    fn scanner_is_linear() {
+        // "<noscript>" repeated with no closing tag was quadratic: a 1 MB page
+        // took over twelve seconds.
+        let html = "<noscript>".repeat(80_000);
+        let start = std::time::Instant::now();
+        let _ = rewrite_html(&html, "https://e.com/p");
+        assert!(start.elapsed().as_secs() < 2, "took {:?}", start.elapsed());
+    }
+
+    #[test]
+    fn document_base_keeps_the_path() {
+        assert_eq!(document_base("https://e.com/blog/post/page"), "https://e.com/blog/post/");
+        assert_eq!(document_base("https://e.com/page"), "https://e.com/");
+        assert_eq!(document_base("https://e.com"), "https://e.com/");
+        assert_eq!(document_base("https://e.com/a/b?x=1#f"), "https://e.com/a/");
+    }
+
+    #[test]
+    fn origin_stops_at_the_authority() {
+        assert_eq!(extract_origin("https://e.com?utm=1"), "https://e.com");
+        assert_eq!(extract_origin("https://e.com#frag"), "https://e.com");
+        // Credentials must never reach the rewritten page.
+        assert_eq!(extract_origin("https://user:s3cret@e.com/x"), "https://e.com");
+    }
+
+    #[test]
+    fn resolves_relative_references() {
+        assert_eq!(resolve_relative(BASE, "page2"), "https://e.com/blog/post/page2");
+        assert_eq!(resolve_relative(BASE, "./page2"), "https://e.com/blog/post/page2");
+        assert_eq!(resolve_relative(BASE, "../other"), "https://e.com/blog/other");
+        assert_eq!(resolve_relative(BASE, "../../../../x"), "https://e.com/x");
+    }
+
+    #[test]
+    fn resolves_redirect_targets() {
+        let b = "https://e.com/a/b";
+        assert_eq!(resolve_redirect(b, "https://x.com/y"), "https://x.com/y");
+        assert_eq!(resolve_redirect(b, "HTTPS://other.com/z"), "HTTPS://other.com/z");
+        assert_eq!(resolve_redirect(b, "/c"), "https://e.com/c");
+        assert_eq!(resolve_redirect(b, "//cdn.e.com/z"), "https://cdn.e.com/z");
+        assert_eq!(resolve_redirect(b, "c"), "https://e.com/a/c");
+        assert_eq!(resolve_redirect(b, "?page=2"), "https://e.com/a/b?page=2");
+        assert_eq!(resolve_redirect("https://e.com", "foo"), "https://e.com/foo");
+        assert_eq!(resolve_redirect("https://e.com/a/b?next=/x/y", "c"), "https://e.com/a/c");
     }
 
     #[test]
     fn blocks_non_public_addresses() {
         for ip in [
-            "127.0.0.1", "10.0.0.5", "192.168.1.1", "172.16.0.1",
-            "169.254.169.254", "0.0.0.0", "100.64.0.1", "::1", "fe80::1",
-            "fc00::1", "::ffff:127.0.0.1",
+            "127.0.0.1", "10.0.0.5", "192.168.1.1", "172.16.0.1", "169.254.169.254",
+            "0.0.0.0", "100.64.0.1", "198.18.0.1", "192.0.0.1", "192.88.99.1",
+            "::1", "fe80::1", "fc00::1", "fec0::1", "2001:db8::1", "100::1",
+            "::ffff:127.0.0.1", "::127.0.0.1", "::ffff:0:127.0.0.1",
+            "64:ff9b::7f00:1", "2002:7f00:1::1",
         ] {
             assert!(is_blocked_ip(&ip.parse().unwrap()), "{ip} should be blocked");
         }
@@ -718,27 +1175,65 @@ mod tests {
     }
 
     #[test]
-    fn parses_host_and_port() {
+    fn host_parsing_matches_the_http_client() {
         assert_eq!(split_host_port("https://e.com/a"), Some(("e.com".into(), 443)));
-        assert_eq!(split_host_port("http://e.com/a"), Some(("e.com".into(), 80)));
         assert_eq!(split_host_port("http://e.com:8080/a?b=1"), Some(("e.com".into(), 8080)));
         assert_eq!(split_host_port("http://[::1]:9000/a"), Some(("::1".into(), 9000)));
-        assert_eq!(split_host_port("http://[::1]/a"), Some(("::1".into(), 80)));
-        // userinfo must not be mistaken for the host
         assert_eq!(split_host_port("http://user@127.0.0.1/a"), Some(("127.0.0.1".into(), 80)));
+        // A backslash ends the authority, so this is loopback, not evil.example.com.
+        assert_eq!(
+            split_host_port("http://127.0.0.1\\@evil.example.com/"),
+            Some(("127.0.0.1".into(), 80))
+        );
     }
 
     #[test]
-    fn resolves_redirect_targets() {
-        let b = "https://e.com/a/b";
-        assert_eq!(resolve_redirect(b, "https://x.com/y"), "https://x.com/y");
-        assert_eq!(resolve_redirect(b, "/c"), "https://e.com/c");
-        assert_eq!(resolve_redirect(b, "//cdn.e.com/z"), "https://cdn.e.com/z");
-        assert_eq!(resolve_redirect(b, "c"), "https://e.com/a/c");
+    fn query_and_fragment_are_encoded() {
+        assert_eq!(
+            rewrite_single_href("/next?x=1&y=2#f", BASE),
+            "/https://e.com/next%3Fx=1&y=2%23f"
+        );
+        assert_eq!(rewrite_single_href("//cdn.e.com/x.js", BASE), "/https://cdn.e.com/x.js");
+        assert_eq!(rewrite_single_href("#top", BASE), "#top");
+        assert_eq!(rewrite_single_href("mailto:a@b.c", BASE), "mailto:a@b.c");
     }
 
     #[test]
-    fn noscript_is_unwrapped() {
-        assert_eq!(unwrap_noscript("<noscript><img src=a></noscript>"), "<img src=a>");
+    fn decodes_legacy_charsets() {
+        assert_eq!(decode_html(b"caf\xe9", "text/html; charset=iso-8859-1"), "caf\u{e9}");
+        let meta = b"<html><head><meta charset=\"iso-8859-1\"></head><body>caf\xe9</body></html>";
+        assert!(decode_html(meta, "text/html").contains("caf\u{e9}"));
+        assert_eq!(decode_html("caf\u{e9}".as_bytes(), "text/html; charset=utf-8"), "caf\u{e9}");
+    }
+
+    #[test]
+    fn parses_charset_from_content_type() {
+        assert_eq!(charset_from_content_type("text/html; charset=UTF-8"), Some("UTF-8".into()));
+        assert_eq!(charset_from_content_type("text/html;charset=\"gbk\""), Some("gbk".into()));
+        assert_eq!(charset_from_content_type("text/html"), None);
+    }
+
+    #[test]
+    fn cache_respects_ttl_and_budget() {
+        let cache = Cache::new(300, 1);
+        let page = CachedPage {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: vec![b'x'; 600 * 1024],
+        };
+        cache.put("a".into(), page.clone());
+        assert!(cache.get("a").is_some());
+        // The second entry does not fit alongside the first, so the older goes.
+        cache.put("b".into(), page);
+        assert!(cache.get("b").is_some());
+        assert!(cache.get("a").is_none());
+
+        let off = Cache::new(0, 32);
+        off.put("a".into(), CachedPage {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: vec![1],
+        });
+        assert!(off.get("a").is_none());
     }
 }

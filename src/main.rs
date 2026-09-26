@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, RawQuery, State},
     http::StatusCode,
     response::{Html, IntoResponse, Response},
     routing::get,
@@ -8,6 +8,8 @@ use axum::{
 use clap::Parser;
 use reqwest::Client;
 use std::{sync::Arc, time::Duration};
+use tower::ServiceBuilder;
+use tower_http::compression::CompressionLayer;
 use tracing::info;
 
 mod proxy;
@@ -45,6 +47,18 @@ pub struct Config {
     #[arg(long, env = "MAX_BODY_MB", default_value = "25")]
     pub max_body_mb: usize,
 
+    /// How long to keep a fetched page in memory, in seconds. 0 disables the cache.
+    #[arg(long, env = "CACHE_TTL", default_value = "300")]
+    pub cache_ttl: u64,
+
+    /// Memory budget for the page cache, in megabytes
+    #[arg(long, env = "CACHE_MB", default_value = "32")]
+    pub cache_mb: usize,
+
+    /// Maximum number of requests handled at once. Further requests queue.
+    #[arg(long, env = "MAX_CONCURRENT", default_value = "16")]
+    pub max_concurrent: usize,
+
     /// Allow proxying to loopback, private and link-local addresses.
     /// Off by default: otherwise anyone who can reach this server can use it
     /// to probe the network it runs on.
@@ -56,6 +70,7 @@ pub struct Config {
 pub struct AppState {
     pub client: Client,
     pub config: Config,
+    pub cache: proxy::Cache,
 }
 
 // Embed the frontend at compile time — zero runtime filesystem reads
@@ -79,13 +94,20 @@ async fn main() {
         // Redirects are followed manually in proxy::fetch_guarded so every hop
         // can be checked against the SSRF guard before it is requested.
         .redirect(reqwest::redirect::Policy::none())
+        // Filter DNS answers at the point reqwest actually connects, so a name
+        // cannot resolve to a public address for the check and a private one
+        // for the request.
+        .dns_resolver(Arc::new(proxy::GuardedResolver::new(
+            config.allow_private_hosts,
+        )))
         .gzip(true)
         .brotli(true)
         .deflate(true)
         .build()
         .expect("failed to build HTTP client");
 
-    let state = Arc::new(AppState { client, config: config.clone() });
+    let cache = proxy::Cache::new(config.cache_ttl, config.cache_mb);
+    let state = Arc::new(AppState { client, config: config.clone(), cache });
 
     let app = Router::new()
         .route("/", get(index_handler))
@@ -94,7 +116,16 @@ async fn main() {
         .route("/raw/*url", get(raw_handler))
         // Main proxy — catches /*url where url starts with http or https
         .route("/*url", get(proxy_handler))
-        .with_state(state);
+        .with_state(state)
+        .layer(
+            ServiceBuilder::new()
+                // Bound in-flight work: each request buffers a whole body, so
+                // unbounded concurrency can exhaust a small host.
+                .concurrency_limit(config.max_concurrent)
+                // Article HTML compresses to a fraction of its size, which is
+                // most of the transfer time over a home network.
+                .layer(CompressionLayer::new()),
+        );
 
     let addr = format!("{}:{}", config.host, config.port);
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -119,9 +150,9 @@ async fn health_handler() -> impl IntoResponse {
 async fn proxy_handler(
     State(state): State<Arc<AppState>>,
     Path(url): Path<String>,
+    RawQuery(query): RawQuery,
 ) -> Response {
-    // URL comes in percent-encoded from the browser, decode it
-    let target_url = decode_url(&url);
+    let target_url = with_query(&decode_url(&url), query.as_deref());
 
     // Must look like a URL
     if !target_url.starts_with("http://") && !target_url.starts_with("https://") {
@@ -145,8 +176,9 @@ async fn proxy_handler(
 async fn raw_handler(
     State(state): State<Arc<AppState>>,
     Path(url): Path<String>,
+    RawQuery(query): RawQuery,
 ) -> Response {
-    let target_url = decode_url(&url);
+    let target_url = with_query(&decode_url(&url), query.as_deref());
 
     if !target_url.starts_with("http://") && !target_url.starts_with("https://") {
         return (StatusCode::BAD_REQUEST, "URL must start with http:// or https://").into_response();
@@ -172,6 +204,18 @@ fn decode_url(raw: &str) -> String {
         raw.replacen("http:/", "http://", 1)
     } else {
         raw.to_string()
+    }
+}
+
+/// Append the request's own query string to the target URL.
+///
+/// The `/*url` wildcard captures only the path, so a typed URL such as
+/// `/https://site/search?q=rust`, or a GET form submitted from a proxied page,
+/// would otherwise lose everything after the `?`.
+fn with_query(target: &str, query: Option<&str>) -> String {
+    match query {
+        Some(q) if !q.is_empty() && !target.contains('?') => format!("{target}?{q}"),
+        _ => target.to_string(),
     }
 }
 

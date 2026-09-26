@@ -31,6 +31,9 @@ cargo build --release
       --x-forwarded-for <IP> Spoofed client IP  [default: 66.249.66.1]
       --timeout <SECS>       Request timeout    [default: 30]
       --max-body-mb <MB>     Max response size  [default: 25]
+      --cache-ttl <SECS>     Page cache lifetime [default: 300, 0 disables]
+      --cache-mb <MB>        Page cache budget   [default: 32]
+      --max-concurrent <N>   In-flight requests  [default: 16]
       --allow-private-hosts  Permit loopback / private / link-local targets
 ```
 
@@ -77,7 +80,11 @@ javascript:(function(){window.location.href='http://localhost:8080/'+encodeURICo
 - Unwraps `<noscript>` so lazy-loaded images become real images
 - Injects `<base href="...">` so relative resources (CSS, images) load directly from origin
 - Rewrites `<a href>` links to stay proxied through 67ft
+- Rewrites `<form action>` so on-site search keeps working, and forwards the
+  query string on to the target
+- Decodes legacy charsets to UTF-8 rather than mangling them
 - Strips CSP / X-Frame-Options headers that would block rendering
+- Caches rendered pages in memory, and compresses responses on the way out
 
 Because scripts are removed, interactive features such as comments, embedded
 players and infinite scroll will not work. That is the trade for reliable text.
@@ -98,6 +105,24 @@ Type=simple
 ExecStart=/home/pi/67ft/67ft --port 8080
 Restart=on-failure
 RestartSec=5
+
+# This process fetches arbitrary URLs, so give it as little of the host as
+# possible.
+DynamicUser=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
 
 [Install]
 WantedBy=multi-user.target

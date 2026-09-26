@@ -10,14 +10,20 @@ path = "src/main.rs"
 
 [dependencies]
 axum = "0.7"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "sync"] }
+tower = { version = "0.5", features = ["limit", "util", "buffer"] }
+tower-http = { version = "0.6", features = ["compression-gzip", "compression-br", "compression-deflate"] }
+encoding_rs = "0.8"
+url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "brotli", "deflate"] }
 clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.release]
-opt-level = "z"     # optimize for size
+# "s" keeps the binary small without the throughput penalty "z" costs on ARM,
+# which matters because every page walks the HTML byte by byte.
+opt-level = "s"
 lto = true
 codegen-units = 1
 strip = true
