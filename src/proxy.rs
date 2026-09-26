@@ -29,6 +29,206 @@ const STRIP_RESPONSE_HEADERS: &[&str] = &[
     "content-encoding",
 ];
 
+/// Maximum redirect hops we will follow ourselves.
+const MAX_REDIRECTS: usize = 10;
+
+/// True if an address must never be reached through the proxy.
+///
+/// Without this the service is an open relay into whatever network it runs on:
+/// a request for `http://127.0.0.1:...` or `http://192.168.1.1/` is fetched
+/// from the host's own vantage point, and on a cloud box
+/// `http://169.254.169.254/` reaches the instance metadata service.
+fn is_blocked_ip(ip: &std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || o[0] == 0                              // 0.0.0.0/8
+                || (o[0] == 100 && (o[1] & 0xc0) == 64)   // 100.64.0.0/10 CGNAT
+                || o[0] >= 240                            // 240.0.0.0/4 reserved
+        }
+        IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (seg[0] & 0xfe00) == 0xfc00 // fc00::/7 unique local
+                || (seg[0] & 0xffc0) == 0xfe80 // fe80::/10 link local
+                || v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| is_blocked_ip(&IpAddr::V4(v4)))
+        }
+    }
+}
+
+/// Split "scheme://host:port/path" into a host and a port.
+fn split_host_port(url: &str) -> Option<(String, u16)> {
+    let after_scheme = url.find("://")?;
+    let scheme = &url[..after_scheme];
+    let rest = &url[after_scheme + 3..];
+    let authority_end = rest
+        .find(['/', '?', '#'])
+        .unwrap_or(rest.len());
+    let mut authority = &rest[..authority_end];
+
+    // Strip any userinfo, which is not part of the host.
+    if let Some(at) = authority.rfind('@') {
+        authority = &authority[at + 1..];
+    }
+
+    let default_port = if scheme.eq_ignore_ascii_case("https") { 443 } else { 80 };
+
+    // IPv6 literals are bracketed: [::1]:8080
+    if let Some(close) = authority.find(']') {
+        let host = authority.get(1..close)?.to_string();
+        let port = authority[close + 1..]
+            .strip_prefix(':')
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(default_port);
+        return Some((host, port));
+    }
+
+    match authority.rsplit_once(':') {
+        Some((h, p)) => Some((h.to_string(), p.parse().unwrap_or(default_port))),
+        None => Some((authority.to_string(), default_port)),
+    }
+}
+
+/// Resolve a target host and refuse anything that points inside the network.
+async fn ensure_public_host(url: &str) -> Result<(), FetchError> {
+    let (host, port) = split_host_port(url)
+        .ok_or_else(|| FetchError::Blocked("could not parse host from URL".into()))?;
+
+    if host.is_empty() {
+        return Err(FetchError::Blocked("empty host".into()));
+    }
+
+    let addrs: Vec<_> = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|e| FetchError::Request(format!("DNS lookup for {host} failed: {e}")))?
+        .collect();
+
+    if addrs.is_empty() {
+        return Err(FetchError::Request(format!("{host} did not resolve")));
+    }
+    for addr in &addrs {
+        if is_blocked_ip(&addr.ip()) {
+            return Err(FetchError::Blocked(format!(
+                "{host} resolves to {}, which is not a public address",
+                addr.ip()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a Location header against the URL it came from.
+fn resolve_redirect(base: &str, location: &str) -> String {
+    if location.starts_with("http://") || location.starts_with("https://") {
+        return location.to_string();
+    }
+    let origin = extract_origin(base);
+    if let Some(rest) = location.strip_prefix("//") {
+        let scheme = origin.split(':').next().unwrap_or("https");
+        return format!("{scheme}://{rest}");
+    }
+    if location.starts_with('/') {
+        return format!("{origin}{location}");
+    }
+    // Relative to the current directory.
+    let path_start = base.find("://").map(|i| i + 3).unwrap_or(0);
+    let dir_end = base[path_start..]
+        .rfind('/')
+        .map(|i| path_start + i + 1)
+        .unwrap_or(base.len());
+    format!("{}{}", &base[..dir_end], location)
+}
+
+/// Read a response body, refusing anything over `max_bytes`.
+///
+/// The previous code buffered whole bodies with no ceiling, so one large file
+/// could exhaust memory on a small host.
+async fn read_body_capped(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, FetchError> {
+    if let Some(len) = response.content_length() {
+        if len as usize > max_bytes {
+            return Err(FetchError::TooLarge(max_bytes));
+        }
+    }
+    let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| FetchError::Body(e.to_string()))?
+    {
+        if buf.len() + chunk.len() > max_bytes {
+            return Err(FetchError::TooLarge(max_bytes));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// Follow redirects ourselves, checking every hop against the SSRF guard.
+///
+/// reqwest's own redirect policy cannot do the async DNS lookup each hop needs,
+/// so a public URL could otherwise redirect straight to an internal address.
+async fn fetch_guarded(
+    state: &Arc<AppState>,
+    url: &str,
+) -> Result<(reqwest::Response, String), FetchError> {
+    let mut current = url.to_string();
+
+    for _ in 0..=MAX_REDIRECTS {
+        if !state.config.allow_private_hosts {
+            ensure_public_host(&current).await?;
+        }
+        debug!("fetching: {current}");
+
+        let response = state
+            .client
+            .get(&current)
+            .header("User-Agent", &state.config.user_agent)
+            .header("X-Forwarded-For", &state.config.forwarded_for)
+            .header(
+                "Accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            )
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .header("Cache-Control", "no-cache")
+            .header("Pragma", "no-cache")
+            // Pretend we came from Google search
+            .header("Referer", "https://www.google.com/")
+            .send()
+            .await
+            .map_err(|e| FetchError::Request(e.to_string()))?;
+
+        if response.status().is_redirection() {
+            let location = response
+                .headers()
+                .get(axum::http::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .map(|l| resolve_redirect(&current, l));
+
+            if let Some(next) = location {
+                current = next;
+                continue;
+            }
+        }
+        return Ok((response, current));
+    }
+    Err(FetchError::Request("too many redirects".into()))
+}
+
 /// Fetch a URL as Googlebot, optionally rewrite links so navigation stays proxied.
 /// If `raw` is true, returns the HTML unmodified (no link rewriting).
 pub async fn fetch_and_rewrite(
@@ -36,25 +236,9 @@ pub async fn fetch_and_rewrite(
     url: &str,
     raw: bool,
 ) -> Result<Response, FetchError> {
-    debug!("fetching: {url}");
-
-    let response = state
-        .client
-        .get(url)
-        .header("User-Agent", &state.config.user_agent)
-        .header("X-Forwarded-For", &state.config.forwarded_for)
-        .header(
-            "Accept",
-            "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        )
-        .header("Accept-Language", "en-US,en;q=0.9")
-        .header("Cache-Control", "no-cache")
-        .header("Pragma", "no-cache")
-        // Pretend we came from Google search
-        .header("Referer", "https://www.google.com/")
-        .send()
-        .await
-        .map_err(|e| FetchError::Request(e.to_string()))?;
+    // `final_url` is the URL after redirects, which is what relative links and
+    // the injected <base> must resolve against.
+    let (response, final_url) = fetch_guarded(state, url).await?;
 
     let status = response.status();
     let upstream_headers = response.headers().clone();
@@ -68,12 +252,10 @@ pub async fn fetch_and_rewrite(
 
     // For non-HTML content (images, CSS, fonts etc.), just stream it through as-is.
     let is_html = content_type.contains("text/html");
+    let max_bytes = state.config.max_body_mb.saturating_mul(1024 * 1024);
 
     if !is_html || raw {
-        let body_bytes = response
-            .bytes()
-            .await
-            .map_err(|e| FetchError::Body(e.to_string()))?;
+        let body_bytes = read_body_capped(response, max_bytes).await?;
 
         let mut builder = Response::builder().status(status_convert(status));
 
@@ -93,13 +275,10 @@ pub async fn fetch_and_rewrite(
     }
 
     // --- HTML path ---
-    let html_bytes = response
-        .bytes()
-        .await
-        .map_err(|e| FetchError::Body(e.to_string()))?;
+    let html_bytes = read_body_capped(response, max_bytes).await?;
 
     let html = String::from_utf8_lossy(&html_bytes).into_owned();
-    let rewritten = rewrite_html(&html, url);
+    let rewritten = rewrite_html(&html, &final_url);
 
     let mut builder = Response::builder()
         .status(status_convert(status))
@@ -429,6 +608,21 @@ fn status_convert(s: reqwest::StatusCode) -> StatusCode {
 pub enum FetchError {
     Request(String),
     Body(String),
+    /// Target resolved to a non-public address.
+    Blocked(String),
+    /// Response body exceeded the configured cap.
+    TooLarge(usize),
+}
+
+impl FetchError {
+    /// Status to return to the client for this failure.
+    pub fn status(&self) -> StatusCode {
+        match self {
+            FetchError::Blocked(_) => StatusCode::FORBIDDEN,
+            FetchError::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            _ => StatusCode::BAD_GATEWAY,
+        }
+    }
 }
 
 impl std::fmt::Display for FetchError {
@@ -436,6 +630,10 @@ impl std::fmt::Display for FetchError {
         match self {
             FetchError::Request(e) => write!(f, "request failed: {e}"),
             FetchError::Body(e) => write!(f, "reading response body failed: {e}"),
+            FetchError::Blocked(e) => write!(f, "blocked: {e}"),
+            FetchError::TooLarge(max) => {
+                write!(f, "response exceeded the {} MB limit", max / (1024 * 1024))
+            }
         }
     }
 }
@@ -503,6 +701,40 @@ mod tests {
         assert!(out.contains("OK"), "{out}");
         assert!(out.contains("\u{130}\u{130}\u{130}"), "{out}");
         assert!(!out.contains(r#"href="/x""#), "{out}");
+    }
+
+    #[test]
+    fn blocks_non_public_addresses() {
+        for ip in [
+            "127.0.0.1", "10.0.0.5", "192.168.1.1", "172.16.0.1",
+            "169.254.169.254", "0.0.0.0", "100.64.0.1", "::1", "fe80::1",
+            "fc00::1", "::ffff:127.0.0.1",
+        ] {
+            assert!(is_blocked_ip(&ip.parse().unwrap()), "{ip} should be blocked");
+        }
+        for ip in ["1.1.1.1", "93.184.216.34", "2606:4700::1111"] {
+            assert!(!is_blocked_ip(&ip.parse().unwrap()), "{ip} should be allowed");
+        }
+    }
+
+    #[test]
+    fn parses_host_and_port() {
+        assert_eq!(split_host_port("https://e.com/a"), Some(("e.com".into(), 443)));
+        assert_eq!(split_host_port("http://e.com/a"), Some(("e.com".into(), 80)));
+        assert_eq!(split_host_port("http://e.com:8080/a?b=1"), Some(("e.com".into(), 8080)));
+        assert_eq!(split_host_port("http://[::1]:9000/a"), Some(("::1".into(), 9000)));
+        assert_eq!(split_host_port("http://[::1]/a"), Some(("::1".into(), 80)));
+        // userinfo must not be mistaken for the host
+        assert_eq!(split_host_port("http://user@127.0.0.1/a"), Some(("127.0.0.1".into(), 80)));
+    }
+
+    #[test]
+    fn resolves_redirect_targets() {
+        let b = "https://e.com/a/b";
+        assert_eq!(resolve_redirect(b, "https://x.com/y"), "https://x.com/y");
+        assert_eq!(resolve_redirect(b, "/c"), "https://e.com/c");
+        assert_eq!(resolve_redirect(b, "//cdn.e.com/z"), "https://cdn.e.com/z");
+        assert_eq!(resolve_redirect(b, "c"), "https://e.com/a/c");
     }
 
     #[test]

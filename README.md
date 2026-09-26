@@ -30,7 +30,21 @@ cargo build --release
   -u, --user-agent <UA>      Override User-Agent
       --x-forwarded-for <IP> Spoofed client IP  [default: 66.249.66.1]
       --timeout <SECS>       Request timeout    [default: 30]
+      --max-body-mb <MB>     Max response size  [default: 25]
+      --allow-private-hosts  Permit loopback / private / link-local targets
 ```
+
+## A note on exposure
+
+The default bind is `0.0.0.0`, so the service is reachable from your whole
+network. Targets that resolve to loopback, private, link-local or carrier-grade
+NAT addresses are refused with `403`, and every redirect hop is re-checked, so
+the proxy cannot be used to probe the network it runs on. Pass
+`--allow-private-hosts` only when you trust everyone who can reach the port.
+
+There is still no authentication. Anyone who can reach the port can make your
+host fetch arbitrary public URLs under your IP address. Bind to `127.0.0.1`, or
+put it behind something that authenticates, if that matters to you.
 
 ## URLs
 

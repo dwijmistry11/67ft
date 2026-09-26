@@ -40,6 +40,16 @@ pub struct Config {
     /// Request timeout in seconds
     #[arg(long, env = "TIMEOUT", default_value = "30")]
     pub timeout: u64,
+
+    /// Maximum response size to buffer, in megabytes
+    #[arg(long, env = "MAX_BODY_MB", default_value = "25")]
+    pub max_body_mb: usize,
+
+    /// Allow proxying to loopback, private and link-local addresses.
+    /// Off by default: otherwise anyone who can reach this server can use it
+    /// to probe the network it runs on.
+    #[arg(long, env = "ALLOW_PRIVATE_HOSTS", default_value_t = false)]
+    pub allow_private_hosts: bool,
 }
 
 /// Shared application state
@@ -66,7 +76,9 @@ async fn main() {
     // Build a persistent reqwest client (connection pool, etc.)
     let client = Client::builder()
         .timeout(Duration::from_secs(config.timeout))
-        .redirect(reqwest::redirect::Policy::limited(10))
+        // Redirects are followed manually in proxy::fetch_guarded so every hop
+        // can be checked against the SSRF guard before it is requested.
+        .redirect(reqwest::redirect::Policy::none())
         .gzip(true)
         .brotli(true)
         .deflate(true)
@@ -124,7 +136,7 @@ async fn proxy_handler(
         Ok(response) => response,
         Err(e) => {
             tracing::warn!("proxy error for {target_url}: {e}");
-            error_page(&target_url, &e.to_string()).into_response()
+            (e.status(), error_page(&target_url, &e.to_string())).into_response()
         }
     }
 }
@@ -142,7 +154,7 @@ async fn raw_handler(
 
     match proxy::fetch_and_rewrite(&state, &target_url, true).await {
         Ok(response) => response,
-        Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+        Err(e) => (e.status(), e.to_string()).into_response(),
     }
 }
 
