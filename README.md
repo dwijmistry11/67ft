@@ -92,42 +92,90 @@ players and infinite scroll will not work. That is the trade for reliable text.
 Note that major publishers verify crawlers by reverse DNS on the source IP, so a
 forged user agent alone will not pass on every site.
 
-## Run as a systemd service (Pi / Linux)
+## Run on a Raspberry Pi
 
-```ini
-# /etc/systemd/system/67ft.service
-[Unit]
-Description=67ft Paywall Proxy
-After=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/home/pi/67ft/67ft --port 8080
-Restart=on-failure
-RestartSec=5
-
-# This process fetches arbitrary URLs, so give it as little of the host as
-# possible.
-DynamicUser=yes
-NoNewPrivileges=yes
-PrivateTmp=yes
-PrivateDevices=yes
-ProtectSystem=strict
-ProtectHome=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectControlGroups=yes
-RestrictAddressFamilies=AF_INET AF_INET6
-RestrictNamespaces=yes
-LockPersonality=yes
-MemoryDenyWriteExecute=yes
-SystemCallArchitectures=native
-SystemCallFilter=@system-service
-
-[Install]
-WantedBy=multi-user.target
-```
+One command, from this repo on your laptop:
 
 ```sh
-sudo systemctl enable --now 67ft
+./deploy/deploy.sh pi@raspberrypi.local
 ```
+
+It asks the Pi what it is, cross-compiles a static musl binary to match,
+installs it to `/usr/local/bin/67ft` with a hardened systemd unit, enables it
+at boot and waits for `/health` to answer before claiming success. Re-run it to
+upgrade; your `/etc/67ft.conf` is never overwritten.
+
+If `sudo` on the Pi wants a password — a prompt no non-interactive script can
+answer — it stages everything and hands you the one command to finish with.
+
+Cross-compiling needs one of these on the laptop:
+
+```sh
+cargo install cargo-zigbuild && brew install zig   # lighter, no Docker
+cargo install cross                                # needs Docker running
+```
+
+Or skip both and build on the Pi itself — minutes on a Pi 5 or a CM5, 20 to 40
+on a 3B, where the script drops `lto` so the link fits in 1GB:
+
+```sh
+./deploy/deploy.sh pi@raspberrypi.local --native
+```
+
+### Alongside Pi-hole
+
+They coexist, with two things to know.
+
+**Ports.** Pi-hole v5 serves its admin page from lighttpd on 80; v6 serves it
+from FTL on 80 and 443. 67ft defaults to 8080 and the installer refuses to
+start if anything already holds that port, because moving the Pi-hole admin
+page to 8080 is a common enough thing to have done.
+
+**Priority.** The unit runs at `Nice=10` with half the normal CPU and IO
+weight. A Pi 3B fetching and re-serializing a news page is enough to add
+latency to every DNS lookup in the house, and the article can afford to wait
+where the DNS cannot.
+
+**Memory.** The `MemoryMax` in the unit is a backstop that, on a stock
+Raspberry Pi, does nothing at all: the boards boot without the memory cgroup
+controller, so systemd logs a warning and ignores it. Check with
+
+```sh
+grep memory /sys/fs/cgroup/cgroup.controllers   # no output means it is off
+```
+
+and turn it on, if you want it enforced, by adding `cgroup_enable=memory
+cgroup_memory=1` to `/boot/firmware/cmdline.txt` and rebooting. What bounds the
+process either way is `MAX_CONCURRENT` x `MAX_BODY_MB` plus the cache, set in
+`/etc/67ft.conf` — which is why those are the numbers worth tuning.
+
+### Configuration
+
+Everything lives in `/etc/67ft.conf` as environment variables — the same
+options as the command line, which `67ft --help` lists:
+
+```sh
+sudo nano /etc/67ft.conf
+sudo systemctl restart 67ft
+```
+
+The shipped defaults assume a 4GB board — a Compute Module 5, a Pi 4 or 5 —
+sharing with Pi-hole: 16 concurrent requests, 25MB maximum body, 128MB cache.
+The worst case that matters is `MAX_CONCURRENT` whole bodies buffered at once,
+so those two multiply to a 400MB ceiling. On a 1GB board such as a 3B or a
+Zero 2, use 4 / 10 / 16 instead.
+
+```sh
+systemctl status 67ft          # is it up
+journalctl -u 67ft -f          # what is it doing
+```
+
+The unit is `deploy/67ft.service` if you would rather install it by hand. Two
+details in it are load-bearing and easy to get wrong:
+
+- `RestrictAddressFamilies` **must** include `AF_NETLINK`. glibc's
+  `getaddrinfo` opens a netlink socket to enumerate local interfaces before it
+  will answer, so leaving it out makes every fetch fail name resolution while
+  DNS on the Pi itself — Pi-hole included — looks perfectly healthy.
+- `ProtectHome=yes` empties `/home` for the service, so the binary cannot live
+  in `/home/pi`. It is installed to `/usr/local/bin`.

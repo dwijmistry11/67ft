@@ -1,0 +1,63 @@
+[Unit]
+Description=67ft paywall proxy
+# network-online rather than network: the listener binds immediately, but the
+# first fetch needs a resolver, and on a Pi that is often Pi-hole on this same
+# board still coming up.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/67ft.conf
+ExecStart=/usr/local/bin/67ft
+Restart=on-failure
+RestartSec=5
+
+# Pi-hole answers DNS for the whole house from this board, and a paywall proxy
+# is never the more urgent of the two. Losing a second on an article beats
+# adding latency to every name lookup in the network.
+Nice=10
+CPUWeight=50
+IOWeight=50
+
+# A backstop, not the mechanism. Raspberry Pi OS boots without the memory
+# cgroup controller, and systemd then logs a warning and ignores both of these
+# — check with `grep memory /sys/fs/cgroup/cgroup.controllers`, and enable it
+# by adding `cgroup_enable=memory cgroup_memory=1` to /boot/firmware/cmdline.txt
+# if you want them enforced. What actually bounds this process either way is
+# MAX_CONCURRENT x MAX_BODY_MB plus the cache, set in /etc/67ft.conf.
+MemoryHigh=768M
+MemoryMax=1G
+TasksMax=128
+
+# This process fetches arbitrary URLs on demand, so give it as little of the
+# host as it can run with.
+DynamicUser=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+# AF_NETLINK is not optional. glibc's getaddrinfo opens a netlink socket to
+# enumerate local interfaces before it will answer, so leaving it out makes
+# every fetch fail name resolution while DNS on the host itself — Pi-hole
+# included — looks perfectly healthy. AF_UNIX is for the journal.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
