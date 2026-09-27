@@ -71,12 +71,21 @@ Example: `http://localhost:8080/https://example.com/some-article`
 | Setup | a host that stays on | Load unpacked, once |
 | Caching | yes, in memory | no |
 | Assets, encodings, relative links | rewritten by `proxy.rs` | untouched — the page loads from its real origin |
-| Overlay and blur removal | no | yes, `extension/reader.js` |
-| Cookies sent | never any | stripped per request |
-| Crawler verification by reverse DNS | defeats it | defeats it |
+| Overlay and blur removal | no — they survive as inert markup | yes, `extension/reader.js` |
+| Cookies on the article request | none | none |
+| Cookies on the images and CSS | your own | your own |
+| IP the publisher sees | the server's | yours |
+| Requests before you ask for one | none | one, unless the site is on the auto list |
+| Crawler verification by reverse DNS | defeats neither | defeats neither |
 
 They are independent; running both is fine. The extension is the better desktop
 reader, the server is the only one that can serve a phone.
+
+Neither hides you completely. Both fetch the article itself without cookies,
+but `<base href>` on one side and a plain origin load on the other mean your
+own browser fetches the images and stylesheets straight from the publisher,
+carrying the cookies and the session the article request went to such trouble
+to omit.
 
 ## Bookmarklet
 
