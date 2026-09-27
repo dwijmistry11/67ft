@@ -103,37 +103,3 @@ export async function discoverServer(extra = []) {
   }
   return null;
 }
-
-
-/**
- * Ask the server for a page, but only far enough to learn the status code.
- *
- * fetch resolves as soon as the headers arrive, so aborting here skips the
- * body entirely. The server caches what it fetched either way, which means the
- * navigation that follows a successful probe is usually answered from memory.
- */
-export async function probeProxy(server, target, timeoutMs = 20000) {
-  const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), timeoutMs);
-  try {
-    const res = await fetch(proxiedUrl(server, target), { signal: ctl.signal });
-    const { status } = res;
-    ctl.abort(); // headers are all we needed
-    if (status >= 200 && status < 400) return { ok: true, status };
-    return { ok: false, status, reason: reasonFor(status) };
-  } catch (e) {
-    if (e.name === 'AbortError') return { ok: false, reason: 'the server timed out' };
-    return { ok: false, reason: 'the server could not be reached' };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/** Why a proxied fetch failed, in terms of what the reader should do about it. */
-function reasonFor(status) {
-  if (status === 401 || status === 403) return 'the site blocks the server';
-  if (status === 429) return 'the site is rate-limiting the server';
-  if (status === 404) return 'the server got a 404';
-  if (status >= 500) return 'the site failed for the server';
-  return `the server got HTTP ${status}`;
-}

@@ -41,9 +41,10 @@ reading it through the server.
   With no server set it probes `67ft.lan`, `bliss.local` and `localhost` on
   port 8080 and keeps the first that answers; you can also type one in, scheme
   optional.
-- **This page** — the site, whether you are reading it direct or through the
-  server, and one button to read it. On a proxied page the button turns into
-  *Back to the original*, so the round trip works both ways.
+- **This page** — the site, whether you are reading it direct, as a crawler, or
+  through the server, and one button that reflects that. With the disguise on,
+  it reads *Turn off for this tab*; on a proxied page, *Back to the original*.
+  Every state has a way back.
 - **Mode** — local or server, and *Always, for this site*, which applies the
   current mode to that domain from now on.
 - **Diagnostics** — fetches the current page through the server *without
@@ -104,6 +105,21 @@ which the policy we just imposed does not govern:
   but un-pins rather than deletes one that holds the article
 - undoes `max-height` clamps, fade masks and `filter: blur()` over article text
 - restores scrolling and text selection
+
+### When a site refuses
+
+Roughly one site in seven answers a crawler with a bot wall rather than an
+article, and it is usually a site a normal browser reads without complaint.
+
+Neither mode second-guesses you about it. The page you asked for is fetched,
+and if what comes back looks like a challenge rather than an article you get a
+**!** badge and a line in the popup saying which route produced it — then the
+toolbar button turns it off. A status code on one URL is a poor way to decide
+whether a page is worth reading, and being overruled by that guess is worse
+than seeing the page and deciding.
+
+Quora is the case this was built for: a Cloudflare challenge for the server and
+for the disguise, and twelve thousand characters of article for plain Chrome.
 
 ## What it does not do
 

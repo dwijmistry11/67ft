@@ -1,5 +1,5 @@
 import { loadSettings, actionFor, ruleDomain } from './profiles.js';
-import { isProxiedPage, probeProxy, proxiedUrl } from './server.js';
+import { isProxiedPage, proxiedUrl } from './server.js';
 
 // Two populations of rules, because they answer different questions.
 //
@@ -97,35 +97,17 @@ async function toggleTab(tab) {
 }
 
 /**
- * Send a tab through the server, unless the server cannot fetch it.
+ * Send a tab through the server.
  *
- * Roughly one site in seven answers a crawler with a bot wall rather than the
- * article — Cloudflare's "Just a moment", a captcha, a redirect loop. Left
- * alone the reader lands on that instead of the page they asked for, and the
- * page they asked for was very often readable in this browser all along. So
- * ask first, and stay put when the answer is no.
+ * No pre-flight check. Some sites answer a crawler with a bot wall, and the
+ * extension used to refuse the navigation on that basis — but a status code on
+ * one URL is a poor proxy for whether the page is worth reading, and being
+ * overruled by a guess is worse than seeing the page and deciding. If it is
+ * not the page you wanted, the toolbar button turns it off.
  */
 async function goViaServer(tab, settings) {
-  const target = tab.url;
-  const probe = await probeProxy(settings.serverUrl, target);
-
-  if (probe.ok) {
-    await chrome.tabs.update(tab.id, { url: proxiedUrl(settings.serverUrl, target) });
-    return { ok: true };
-  }
-
-  // Not an error to report so much as a route that is closed: the tab stays on
-  // a page that, unlike the server's copy, the browser can usually read.
-  await chrome.storage.session.set({
-    lastFallback: { host: new URL(target).hostname, reason: probe.reason, at: Date.now() },
-  });
-  await chrome.action.setBadgeText({ tabId: tab.id, text: '!' });
-  await chrome.action.setBadgeBackgroundColor({ tabId: tab.id, color: '#c9903a' });
-  await chrome.action.setTitle({
-    tabId: tab.id,
-    title: `67ft — ${probe.reason}. Showing the original.`,
-  });
-  return { ok: false, reason: probe.reason };
+  await chrome.tabs.update(tab.id, { url: proxiedUrl(settings.serverUrl, tab.url) });
+  return { ok: true };
 }
 
 // ------------------------------------------------------------------ auto sites
@@ -197,6 +179,56 @@ async function cleanPage(tabId) {
   }
 }
 
+/**
+ * Did local mode turn this page into a bot wall?
+ *
+ * Claiming to be Googlebot from a home address is a combination some sites
+ * refuse outright, and the page they serve instead is worse than the one they
+ * would have served us as ourselves. The disguise is not worth a door that was
+ * already open.
+ */
+async function hitBotWall(tabId) {
+  try {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const title = (document.title || '').toLowerCase();
+        const body = (document.body?.innerText || '').slice(0, 3000).toLowerCase();
+        return [
+          'just a moment', 'checking your browser', 'attention required',
+          'verify you are human', 'enable javascript and cookies to continue',
+          'access denied', 'are you a robot', 'unusual traffic',
+        ].some((m) => title.includes(m) || body.includes(m));
+      },
+    });
+    return !!res?.result;
+  } catch {
+    return false; // injection refused: nothing we can conclude
+  }
+}
+
+/**
+ * Say that this page looks like a bot wall, and leave it alone.
+ *
+ * The reader can see the page perfectly well; what they cannot see is which of
+ * the two routes produced it. That is the only thing worth adding.
+ */
+async function flagBotWall(tab, route) {
+  await chrome.storage.session.set({
+    lastFallback: {
+      host: new URL(tab.url).hostname,
+      route,
+      at: Date.now(),
+    },
+  });
+  await chrome.action.setBadgeText({ tabId: tab.id, text: '!' });
+  await chrome.action.setBadgeBackgroundColor({ tabId: tab.id, color: '#c9903a' });
+  await chrome.action.setTitle({
+    tabId: tab.id,
+    title: '67ft — this looks like a bot wall. Turn it off to see the site normally.',
+  });
+}
+
 chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
   const settings = await loadSettings();
 
@@ -219,6 +251,12 @@ chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
 
   if (!viaServer && !viaLocal) {
     await chrome.action.setBadgeText({ tabId, text: '' });
+    await chrome.action.setTitle({ tabId, title: '67ft' });
+    return;
+  }
+
+  if (await hitBotWall(tabId)) {
+    await flagBotWall(tab, viaServer ? 'server' : 'local');
     return;
   }
 
@@ -241,6 +279,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
   if (msg?.type === 'enable-local') {
     chrome.tabs.get(msg.tabId).then(enableTab).then(() => respond({ ok: true }));
     return true; // respond asynchronously
+  }
+  if (msg?.type === 'disable-local') {
+    disableTab(msg.tabId).then(() => respond({ ok: true }));
+    return true;
   }
   if (msg?.type === 'go-server') {
     (async () => {

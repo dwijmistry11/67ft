@@ -5,7 +5,12 @@ import {
 } from './server.js';
 
 const $ = (id) => document.getElementById(id);
-const state = { settings: null, tab: null, health: null, lastCheck: null, lastTest: null };
+const state = {
+  settings: null, tab: null, health: null,
+  lastCheck: null, lastTest: null,
+  // Whether the disguise is currently applied to this tab.
+  localOn: false,
+};
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -21,6 +26,24 @@ function tabHost() {
 function targetUrl() {
   const { serverUrl } = state.settings;
   return unproxyUrl(serverUrl, state.tab.url) || state.tab.url;
+}
+
+/**
+ * Is local mode actually in force for this tab right now?
+ *
+ * Read from the rules themselves rather than from a stored flag: the session
+ * rule is the thing that does the work, so it is the thing worth asking.
+ */
+async function readLocalState() {
+  const host = tabHost();
+  const rules = await chrome.declarativeNetRequest.getSessionRules();
+  if (rules.some((r) => r.condition?.tabIds?.includes(state.tab.id))) {
+    state.localOn = true;
+    return;
+  }
+  const domain = host && ruleDomain(host);
+  state.localOn = !!domain
+    && state.settings.autoSites.some((s) => ruleDomain(s) === domain);
 }
 
 function row(key, value) {
@@ -114,12 +137,23 @@ function paintPage() {
     : host || 'no page';
 
   const pill = $('page-pill');
-  pill.textContent = proxied ? 'via server' : 'direct';
-  pill.className = proxied ? 'pill' : 'pill off';
 
   $('restore').hidden = !proxied;
-  $('go').textContent = mode === 'server' ? 'Read via the server' : 'Read as a crawler';
-  $('go').disabled = !host;
+
+  const go = $('go');
+  if (state.localOn) {
+    // The off switch. Its absence was the whole problem: a site that refuses
+    // the disguise left you with no way back to the page as it really is.
+    go.textContent = 'Turn off for this tab';
+    go.className = 'action secondary';
+  } else {
+    go.textContent = mode === 'server' ? 'Read via the server' : 'Read as a crawler';
+    go.className = 'action';
+  }
+  go.disabled = !host;
+
+  pill.textContent = proxied ? 'via server' : state.localOn ? 'as crawler' : 'direct';
+  pill.className = proxied || state.localOn ? 'pill' : 'pill off';
 
   $('auto-host').textContent = host ? ruleDomain(host) : 'this site';
   $('auto').checked = !!host && autoSites.some((s) => ruleDomain(s) === ruleDomain(host));
@@ -137,22 +171,14 @@ function showNotice(text) {
 }
 
 async function go() {
+  if (state.localOn) {
+    await chrome.runtime.sendMessage({ type: 'disable-local', tabId: state.tab.id });
+    window.close();
+    return;
+  }
   if (state.settings.mode === 'server') {
     if (!state.health?.ok) return;
-    $('go').textContent = 'checking…';
-    $('go').disabled = true;
-
-    // The background asks the server whether it can fetch this page before
-    // sending the tab anywhere, so a bot wall never becomes the thing you are
-    // looking at.
-    const r = await chrome.runtime.sendMessage({ type: 'go-server', tabId: state.tab.id });
-    if (!r?.ok) {
-      $('go').textContent = 'Read via the server';
-      $('go').disabled = false;
-      showNotice(`Not sent: ${r?.reason || 'the server could not fetch it'}. `
-        + 'This page is often readable here as it is — try Local instead.');
-      return;
-    }
+    await chrome.runtime.sendMessage({ type: 'go-server', tabId: state.tab.id });
   } else {
     await chrome.runtime.sendMessage({ type: 'enable-local', tabId: state.tab.id });
   }
@@ -180,15 +206,19 @@ async function runTest() {
 async function init() {
   state.settings = await loadSettings();
   [state.tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  await readLocalState();
 
   paintPage();
   paintServer();
 
   const { lastFallback } = await chrome.storage.session.get('lastFallback');
   if (lastFallback && lastFallback.host === tabHost()
-      && Date.now() - lastFallback.at < 60_000) {
-    showNotice(`Not sent: ${lastFallback.reason}. Showing the original, `
-      + 'which is often readable as it is.');
+      && Date.now() - lastFallback.at < 120_000) {
+    showNotice(lastFallback.route === 'server'
+      ? 'This looks like a bot wall rather than the article. The server is '
+        + 'blocked here — the site is often readable in this browser as it is.'
+      : 'This looks like a bot wall rather than the article. This site refuses '
+        + 'the crawler disguise — turn it off above to see it normally.');
   }
 
   // A server that was never configured is worth one quiet probe: the common
