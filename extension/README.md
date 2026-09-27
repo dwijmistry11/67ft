@@ -41,9 +41,10 @@ reading it through the server.
   With no server set it probes `67ft.lan`, `bliss.local` and `localhost` on
   port 8080 and keeps the first that answers; you can also type one in, scheme
   optional.
-- **This page** — the site, whether you are reading it direct or through the
-  server, and one button to read it. On a proxied page the button turns into
-  *Back to the original*, so the round trip works both ways.
+- **This page** — the site, whether you are reading it direct, as a crawler, or
+  through the server, and one button that reflects that. With the disguise on,
+  it reads *Turn off for this tab*; on a proxied page, *Back to the original*.
+  Every state has a way back.
 - **Mode** — local or server, and *Always, for this site*, which applies the
   current mode to that domain from now on.
 - **Diagnostics** — fetches the current page through the server *without
@@ -104,6 +105,22 @@ which the policy we just imposed does not govern:
   but un-pins rather than deletes one that holds the article
 - undoes `max-height` clamps, fade masks and `filter: blur()` over article text
 - restores scrolling and text selection
+
+### When a site refuses
+
+Roughly one site in seven answers a crawler with a bot wall rather than an
+article, and it is usually a site a normal browser reads without complaint.
+Both modes now check rather than assume.
+
+In server mode the extension asks the server for the page before sending the
+tab anywhere, and stays put if the server cannot fetch it. In local mode it
+looks at the page the disguise produced, and if that page is a challenge or a
+block it withdraws the disguise for that site, reloads it normally, and says so
+with a **!** badge. The site is set aside for the rest of the browser session
+only; the popup offers to try it again.
+
+Quora is the case this was built for: a Cloudflare challenge for the server and
+for the disguise, and twelve thousand characters of article for plain Chrome.
 
 ## What it does not do
 

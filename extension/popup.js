@@ -5,7 +5,12 @@ import {
 } from './server.js';
 
 const $ = (id) => document.getElementById(id);
-const state = { settings: null, tab: null, health: null, lastCheck: null, lastTest: null };
+const state = {
+  settings: null, tab: null, health: null,
+  lastCheck: null, lastTest: null,
+  // Whether the disguise is currently applied to this tab, by either route.
+  localOn: false, suppressed: [],
+};
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -21,6 +26,27 @@ function tabHost() {
 function targetUrl() {
   const { serverUrl } = state.settings;
   return unproxyUrl(serverUrl, state.tab.url) || state.tab.url;
+}
+
+/**
+ * Is local mode actually in force for this tab right now?
+ *
+ * Read from the rules themselves rather than from a stored flag: the session
+ * rule is the thing that does the work, so it is the thing worth asking.
+ */
+async function readLocalState() {
+  const host = tabHost();
+  state.suppressed = (await chrome.storage.session.get('suppressedHosts')).suppressedHosts || [];
+
+  const rules = await chrome.declarativeNetRequest.getSessionRules();
+  if (rules.some((r) => r.condition?.tabIds?.includes(state.tab.id))) {
+    state.localOn = true;
+    return;
+  }
+  const domain = host && ruleDomain(host);
+  state.localOn = !!domain
+    && !state.suppressed.includes(domain)
+    && state.settings.autoSites.some((s) => ruleDomain(s) === domain);
 }
 
 function row(key, value) {
@@ -114,15 +140,27 @@ function paintPage() {
     : host || 'no page';
 
   const pill = $('page-pill');
-  pill.textContent = proxied ? 'via server' : 'direct';
-  pill.className = proxied ? 'pill' : 'pill off';
 
   $('restore').hidden = !proxied;
-  $('go').textContent = mode === 'server' ? 'Read via the server' : 'Read as a crawler';
-  $('go').disabled = !host;
+
+  const go = $('go');
+  if (state.localOn) {
+    // The off switch. Its absence was the whole problem: a site that refuses
+    // the disguise left you with no way back to the page as it really is.
+    go.textContent = 'Turn off for this tab';
+    go.className = 'action secondary';
+  } else {
+    go.textContent = mode === 'server' ? 'Read via the server' : 'Read as a crawler';
+    go.className = 'action';
+  }
+  go.disabled = !host;
+
+  pill.textContent = proxied ? 'via server' : state.localOn ? 'as crawler' : 'direct';
+  pill.className = proxied || state.localOn ? 'pill' : 'pill off';
 
   $('auto-host').textContent = host ? ruleDomain(host) : 'this site';
-  $('auto').checked = !!host && autoSites.some((s) => ruleDomain(s) === ruleDomain(host));
+  $('auto').checked = !!host && autoSites.some((s) => ruleDomain(s) === ruleDomain(host))
+    && !state.suppressed.includes(ruleDomain(host));
 
   for (const el of document.querySelectorAll('.mode')) {
     el.classList.toggle('on', el.dataset.mode === mode);
@@ -137,6 +175,11 @@ function showNotice(text) {
 }
 
 async function go() {
+  if (state.localOn) {
+    await chrome.runtime.sendMessage({ type: 'disable-local', tabId: state.tab.id });
+    window.close();
+    return;
+  }
   if (state.settings.mode === 'server') {
     if (!state.health?.ok) return;
     $('go').textContent = 'checking…';
@@ -180,15 +223,30 @@ async function runTest() {
 async function init() {
   state.settings = await loadSettings();
   [state.tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  await readLocalState();
 
   paintPage();
   paintServer();
 
-  const { lastFallback } = await chrome.storage.session.get('lastFallback');
-  if (lastFallback && lastFallback.host === tabHost()
-      && Date.now() - lastFallback.at < 60_000) {
-    showNotice(`Not sent: ${lastFallback.reason}. Showing the original, `
-      + 'which is often readable as it is.');
+  const host = tabHost();
+  const domain = host && ruleDomain(host);
+  if (domain && state.suppressed.includes(domain)) {
+    showNotice(`${domain} refuses the crawler disguise, so it is switched off `
+      + 'here and showing normally. Click to try it again.');
+    $('notice').style.cursor = 'pointer';
+    $('notice').onclick = async () => {
+      await chrome.runtime.sendMessage({ type: 'unsuppress', domain });
+      showNotice('');
+      chrome.tabs.reload(state.tab.id);
+      window.close();
+    };
+  } else {
+    const { lastFallback } = await chrome.storage.session.get('lastFallback');
+    if (lastFallback && lastFallback.host === host
+        && Date.now() - lastFallback.at < 60_000) {
+      showNotice(`Not sent: ${lastFallback.reason}. Showing the original, `
+        + 'which is often readable as it is.');
+    }
   }
 
   // A server that was never configured is worth one quiet probe: the common

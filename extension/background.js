@@ -14,6 +14,12 @@ import { isProxiedPage, probeProxy, proxiedUrl } from './server.js';
 const SESSION_ID = (tabId) => tabId + 1; // rule ids must be >= 1
 const AUTO_ID_BASE = 1_000_000;
 
+/** Hosts withdrawn from local mode this session because they bot-walled us. */
+async function suppressed() {
+  const { suppressedHosts } = await chrome.storage.session.get('suppressedHosts');
+  return suppressedHosts || [];
+}
+
 /** Is 67ft active for this tab — by manual toggle, or because the site is on the auto list? */
 async function activeFor(tab) {
   if (!tab?.url || !/^https?:/.test(tab.url)) return false;
@@ -21,8 +27,11 @@ async function activeFor(tab) {
   const session = await chrome.declarativeNetRequest.getSessionRules();
   if (session.some((r) => r.id === SESSION_ID(tab.id))) return true;
 
+  const host = new URL(tab.url).hostname;
+  if ((await suppressed()).includes(ruleDomain(host.toLowerCase()))) return false;
+
   const { autoSites } = await loadSettings();
-  return matchesAutoSite(new URL(tab.url).hostname, autoSites);
+  return matchesAutoSite(host, autoSites);
 }
 
 function matchesAutoSite(hostname, autoSites) {
@@ -145,8 +154,10 @@ async function syncAutoRules() {
   // In server mode the same list means "send these to the server", which is a
   // navigation rather than a header rewrite. Leaving the header rules live
   // would disguise a request that is not being made from here anyway.
+  const off = await suppressed();
   const domains = settings.mode === 'local'
     ? [...new Set(autoSites.map((s) => ruleDomain(s.trim().toLowerCase())).filter(Boolean))]
+        .filter((d) => !off.includes(d))
     : [];
 
   await chrome.declarativeNetRequest.updateDynamicRules({
@@ -197,6 +208,57 @@ async function cleanPage(tabId) {
   }
 }
 
+/**
+ * Did local mode turn this page into a bot wall?
+ *
+ * Claiming to be Googlebot from a home address is a combination some sites
+ * refuse outright, and the page they serve instead is worse than the one they
+ * would have served us as ourselves. The disguise is not worth a door that was
+ * already open.
+ */
+async function hitBotWall(tabId) {
+  try {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const title = (document.title || '').toLowerCase();
+        const body = (document.body?.innerText || '').slice(0, 3000).toLowerCase();
+        return [
+          'just a moment', 'checking your browser', 'attention required',
+          'verify you are human', 'enable javascript and cookies to continue',
+          'access denied', 'are you a robot', 'unusual traffic',
+        ].some((m) => title.includes(m) || body.includes(m));
+      },
+    });
+    return !!res?.result;
+  } catch {
+    return false; // injection refused: nothing we can conclude
+  }
+}
+
+async function backOffFrom(tab) {
+  const domain = ruleDomain(new URL(tab.url).hostname.toLowerCase());
+  const list = await suppressed();
+  if (!list.includes(domain)) {
+    await chrome.storage.session.set({ suppressedHosts: [...list, domain] });
+  }
+  await chrome.storage.session.set({
+    lastFallback: {
+      host: new URL(tab.url).hostname,
+      reason: 'the site blocks the crawler disguise',
+      at: Date.now(),
+    },
+  });
+  await syncAutoRules();          // drop it from the persistent rules too
+  await disableTab(tab.id);       // removes the session rule and reloads clean
+  await chrome.action.setBadgeText({ tabId: tab.id, text: '!' });
+  await chrome.action.setBadgeBackgroundColor({ tabId: tab.id, color: '#c9903a' });
+  await chrome.action.setTitle({
+    tabId: tab.id,
+    title: '67ft — this site refuses the crawler disguise. Showing it normally.',
+  });
+}
+
 chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
   const settings = await loadSettings();
 
@@ -218,7 +280,28 @@ chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
   const viaLocal = await activeFor(tab);
 
   if (!viaServer && !viaLocal) {
+    // A site we backed off from is not simply "off": the reload that follows
+    // backOffFrom lands here and would otherwise wipe the warning badge it
+    // just set, leaving no sign that the disguise was withdrawn.
+    const host = tab.url && /^https?:/.test(tab.url)
+      ? ruleDomain(new URL(tab.url).hostname.toLowerCase()) : null;
+    if (host && (await suppressed()).includes(host)) {
+      await chrome.action.setBadgeText({ tabId, text: '!' });
+      await chrome.action.setBadgeBackgroundColor({ tabId, color: '#c9903a' });
+      await chrome.action.setTitle({
+        tabId,
+        title: '67ft — this site refuses the crawler disguise. Showing it normally.',
+      });
+      return;
+    }
     await chrome.action.setBadgeText({ tabId, text: '' });
+    await chrome.action.setTitle({ tabId, title: '67ft' });
+    return;
+  }
+
+  // Before anything else: if the disguise is what produced this page, undo it.
+  if (viaLocal && (await hitBotWall(tabId))) {
+    await backOffFrom(tab);
     return;
   }
 
@@ -241,6 +324,21 @@ chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
   if (msg?.type === 'enable-local') {
     chrome.tabs.get(msg.tabId).then(enableTab).then(() => respond({ ok: true }));
     return true; // respond asynchronously
+  }
+  if (msg?.type === 'disable-local') {
+    disableTab(msg.tabId).then(() => respond({ ok: true }));
+    return true;
+  }
+  if (msg?.type === 'unsuppress') {
+    (async () => {
+      const list = await suppressed();
+      await chrome.storage.session.set({
+        suppressedHosts: list.filter((d) => d !== msg.domain),
+      });
+      await syncAutoRules();
+      respond({ ok: true });
+    })();
+    return true;
   }
   if (msg?.type === 'go-server') {
     (async () => {
