@@ -1,0 +1,16 @@
+/* Paywalls lock the page behind the overlay by freezing the scroll container.
+ * With scripts dead the overlay can no longer unfreeze it, so the page would
+ * stay stuck at the top even after the overlay is gone. */
+html, body {
+  overflow: auto !important;
+  height: auto !important;
+  max-height: none !important;
+  position: static !important;
+}
+
+body {
+  /* The other half of the lock: text you can see but not select or reach. */
+  user-select: text !important;
+  -webkit-user-select: text !important;
+  pointer-events: auto !important;
+}

@@ -4,6 +4,9 @@ Self-hosted paywall bypass proxy — a fast, single-binary Rust alternative to [
 
 Pretends to be Googlebot to fetch full article content. Runs as a single static binary with no runtime dependencies. Designed to run on a Raspberry Pi 3B.
 
+Also available as a Chrome extension in [`extension/`](extension/), which does
+the same job with no server at all — see [Two ways to run this](#two-ways-to-run-this).
+
 ---
 
 ## Run (dev)
@@ -59,6 +62,21 @@ put it behind something that authenticates, if that matters to you.
 | `GET /health` | Health check |
 
 Example: `http://localhost:8080/https://example.com/some-article`
+
+## Two ways to run this
+
+|  | Server | Extension |
+|---|---|---|
+| Reaches | anything on your network — phone, tablet, another laptop | Chrome, on one machine |
+| Setup | a host that stays on | Load unpacked, once |
+| Caching | yes, in memory | no |
+| Assets, encodings, relative links | rewritten by `proxy.rs` | untouched — the page loads from its real origin |
+| Overlay and blur removal | no | yes, `extension/reader.js` |
+| Cookies sent | never any | stripped per request |
+| Crawler verification by reverse DNS | defeats it | defeats it |
+
+They are independent; running both is fine. The extension is the better desktop
+reader, the server is the only one that can serve a phone.
 
 ## Bookmarklet
 

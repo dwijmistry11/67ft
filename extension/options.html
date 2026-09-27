@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>67ft — Options</title>
+<style>
+  :root { color-scheme: light dark; --accent: #7c6af7; }
+  body {
+    font: 15px/1.55 system-ui, -apple-system, sans-serif;
+    max-width: 44rem; margin: 0 auto; padding: 2.5rem 1.25rem 4rem;
+  }
+  h1 { font-size: 1.5rem; margin: 0 0 .25rem; }
+  h1 span { color: var(--accent); }
+  .sub { color: #888; margin: 0 0 2.5rem; }
+  fieldset { border: 0; padding: 0; margin: 0 0 2.25rem; }
+  legend { font-weight: 600; padding: 0; margin-bottom: .75rem; }
+  label { display: block; margin-bottom: .6rem; }
+  .profile { display: flex; gap: .6rem; align-items: baseline; margin-bottom: .9rem; }
+  .profile input { margin-top: .35rem; }
+  .blurb { display: block; color: #888; font-size: .85rem; }
+  input[type=text], textarea {
+    width: 100%; box-sizing: border-box; padding: .5rem .6rem;
+    font: inherit; font-size: .9rem; border: 1px solid #8884; border-radius: 6px;
+    background: #8881; color: inherit;
+  }
+  textarea { min-height: 7rem; font-family: ui-monospace, SFMono-Regular, monospace; }
+  .hint { color: #888; font-size: .85rem; margin: .4rem 0 0; }
+  button {
+    font: inherit; font-weight: 600; padding: .55rem 1.4rem; border: 0;
+    border-radius: 6px; background: var(--accent); color: #fff; cursor: pointer;
+  }
+  #status { margin-left: 1rem; color: #4a4; font-size: .9rem; opacity: 0; transition: opacity .2s; }
+  #status.show { opacity: 1; }
+</style>
+</head>
+<body>
+  <h1><span>67</span>ft</h1>
+  <p class="sub">Read the article the way a crawler is shown it.</p>
+
+  <form id="form">
+    <fieldset>
+      <legend>Disguise</legend>
+      <div id="profiles"></div>
+      <label style="margin-top:1.25rem">
+        Custom user agent
+        <input type="text" id="customUserAgent" placeholder="Leave empty to use the profile's own">
+      </label>
+      <p class="hint">
+        Overrides the user agent of whichever profile is selected. The cookie and
+        referrer handling stays as the profile defines it.
+      </p>
+    </fieldset>
+
+    <fieldset>
+      <legend>Page handling</legend>
+      <label>
+        <input type="checkbox" id="blockScripts">
+        Block all scripts
+      </label>
+      <p class="hint">
+        Publishers ship single-page apps that re-render from their own router and
+        discard the server-rendered article. Blocking scripts is what makes the
+        crawler's copy of the page survive. Comments, embedded players and
+        infinite scroll stop working — that is the trade for reliable text.
+      </p>
+      <label style="margin-top:1rem">
+        <input type="checkbox" id="cleanOverlays">
+        Clear overlays and unclamp the article
+      </label>
+      <p class="hint">
+        Removes paywall and consent overlays left standing as inert markup,
+        restores scrolling, and undoes blurred or height-clamped article text.
+      </p>
+    </fieldset>
+
+    <fieldset>
+      <legend>Always on for</legend>
+      <textarea id="autoSites" placeholder="nytimes.com&#10;wsj.com&#10;economist.com" spellcheck="false"></textarea>
+      <p class="hint">
+        One hostname per line; subdomains are included. These are disguised from
+        the very first request, so the site never sees you undisguised at all.
+      </p>
+    </fieldset>
+
+    <button type="submit">Save</button>
+    <span id="status">Saved</span>
+  </form>
+
+  <script type="module" src="options.js"></script>
+</body>
+</html>
