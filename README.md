@@ -105,6 +105,9 @@ installs it to `/usr/local/bin/67ft` with a hardened systemd unit, enables it
 at boot and waits for `/health` to answer before claiming success. Re-run it to
 upgrade; your `/etc/67ft.conf` is never overwritten.
 
+If `sudo` on the Pi wants a password — a prompt no non-interactive script can
+answer — it stages everything and hands you the one command to finish with.
+
 Cross-compiling needs one of these on the laptop:
 
 ```sh
@@ -112,8 +115,8 @@ cargo install cargo-zigbuild && brew install zig   # lighter, no Docker
 cargo install cross                                # needs Docker running
 ```
 
-Or skip both and build on the Pi itself — 20 to 40 minutes on a 3B, and the
-script drops `lto` so the link fits in 1GB:
+Or skip both and build on the Pi itself — minutes on a Pi 5 or a CM5, 20 to 40
+on a 3B, where the script drops `lto` so the link fits in 1GB:
 
 ```sh
 ./deploy/deploy.sh pi@raspberrypi.local --native
@@ -133,11 +136,18 @@ weight. A Pi 3B fetching and re-serializing a news page is enough to add
 latency to every DNS lookup in the house, and the article can afford to wait
 where the DNS cannot.
 
-Memory is capped at 256M, but note that Raspberry Pi OS ships with the memory
-cgroup controller **off**. Until `cgroup_enable=memory cgroup_memory=1` is
-added to `/boot/cmdline.txt`, systemd logs a warning and ignores the cap; the
-settings in `/etc/67ft.conf` are what actually bound the process, and they are
-sized so the cap is a backstop rather than the mechanism.
+**Memory.** The `MemoryMax` in the unit is a backstop that, on a stock
+Raspberry Pi, does nothing at all: the boards boot without the memory cgroup
+controller, so systemd logs a warning and ignores it. Check with
+
+```sh
+grep memory /sys/fs/cgroup/cgroup.controllers   # no output means it is off
+```
+
+and turn it on, if you want it enforced, by adding `cgroup_enable=memory
+cgroup_memory=1` to `/boot/firmware/cmdline.txt` and rebooting. What bounds the
+process either way is `MAX_CONCURRENT` x `MAX_BODY_MB` plus the cache, set in
+`/etc/67ft.conf` — which is why those are the numbers worth tuning.
 
 ### Configuration
 
@@ -149,9 +159,11 @@ sudo nano /etc/67ft.conf
 sudo systemctl restart 67ft
 ```
 
-The shipped defaults are sized for a 3B sharing 1GB with Pi-hole: 4 concurrent
-requests, 10MB maximum body, 16MB cache. The worst case that matters is
-`MAX_CONCURRENT` whole bodies buffered at once, so those two multiply.
+The shipped defaults assume a 4GB board — a Compute Module 5, a Pi 4 or 5 —
+sharing with Pi-hole: 16 concurrent requests, 25MB maximum body, 128MB cache.
+The worst case that matters is `MAX_CONCURRENT` whole bodies buffered at once,
+so those two multiply to a 400MB ceiling. On a 1GB board such as a 3B or a
+Zero 2, use 4 / 10 / 16 instead.
 
 ```sh
 systemctl status 67ft          # is it up

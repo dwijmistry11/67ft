@@ -55,8 +55,23 @@ if [ "$MODE" = "--native" ]; then
   ssh "$HOST" 'mv /tmp/67ft-staged ~/.67ft-install/67ft'
 fi
 
-echo "==> installing (sudo on the Pi)"
-ssh -t "$HOST" 'sudo bash ~/.67ft-install/install.sh'
+# sudo on a stock Raspberry Pi OS user is passwordless, but not always, and a
+# password prompt over a non-interactive ssh just hangs. Detect it and hand the
+# step back rather than stalling.
+if ssh "$HOST" 'sudo -n true' 2>/dev/null; then
+  echo "==> installing (passwordless sudo)"
+  ssh -t "$HOST" 'sudo bash ~/.67ft-install/install.sh'
+else
+  cat <<MSG
+
+Everything is staged on the Pi, but sudo there wants a password, which this
+script cannot answer. Run the last step yourself:
+
+  ssh -t $HOST 'sudo bash ~/.67ft-install/install.sh'
+
+MSG
+  exit 2
+fi
 
 # From the Pi, not from the shipped default: a config already on the box is
 # kept, so on a re-deploy those two can disagree.

@@ -20,12 +20,15 @@ Nice=10
 CPUWeight=50
 IOWeight=50
 
-# A Pi 3B has 1GB for both. The settings shipped in /etc/67ft.conf keep this
-# process near 80M; the cap is what stops one pathological page from taking
-# the DNS server down with it.
-MemoryHigh=192M
-MemoryMax=256M
-TasksMax=64
+# A backstop, not the mechanism. Raspberry Pi OS boots without the memory
+# cgroup controller, and systemd then logs a warning and ignores both of these
+# — check with `grep memory /sys/fs/cgroup/cgroup.controllers`, and enable it
+# by adding `cgroup_enable=memory cgroup_memory=1` to /boot/firmware/cmdline.txt
+# if you want them enforced. What actually bounds this process either way is
+# MAX_CONCURRENT x MAX_BODY_MB plus the cache, set in /etc/67ft.conf.
+MemoryHigh=768M
+MemoryMax=1G
+TasksMax=128
 
 # This process fetches arbitrary URLs on demand, so give it as little of the
 # host as it can run with.
