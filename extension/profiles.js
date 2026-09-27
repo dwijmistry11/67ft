@@ -55,6 +55,13 @@ export const PROFILES = {
 };
 
 export const DEFAULT_SETTINGS = {
+  // 'local'  — headers and CSP rewritten here, nothing leaves this browser
+  // 'server' — the tab is sent to a 67ft server, which fetches from its own
+  //            address. The only mode that hides which machine is asking.
+  mode: 'local',
+  // Base URL of that server. Empty until set or discovered.
+  serverUrl: '',
+
   profile: 'googlebot',
   // Replaces the profile's user agent when non-empty.
   customUserAgent: '',

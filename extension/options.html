@@ -39,6 +39,34 @@
 
   <form id="form">
     <fieldset>
+      <legend>Mode</legend>
+      <div class="profile">
+        <input type="radio" name="mode" id="m-local" value="local">
+        <label for="m-local">
+          Local
+          <span class="blurb">Headers and script blocking are rewritten in this
+          browser. Nothing leaves it, and the publisher sees your address.</span>
+        </label>
+      </div>
+      <div class="profile">
+        <input type="radio" name="mode" id="m-server" value="server">
+        <label for="m-server">
+          Via a 67ft server
+          <span class="blurb">The tab is sent to a server that fetches the page
+          from its own address. The only mode that hides which machine is
+          asking, and the only one a phone can share.</span>
+        </label>
+      </div>
+      <label style="margin-top:1rem">
+        Server address
+        <input type="text" id="serverUrl" placeholder="http://67ft.lan:8080" spellcheck="false">
+      </label>
+      <p class="hint" id="server-status">
+        Leave empty and the popup will look for one on the usual names.
+      </p>
+    </fieldset>
+
+    <fieldset>
       <legend>Disguise</legend>
       <div id="profiles"></div>
       <label style="margin-top:1.25rem">
@@ -77,8 +105,10 @@
       <legend>Always on for</legend>
       <textarea id="autoSites" placeholder="nytimes.com&#10;wsj.com&#10;economist.com" spellcheck="false"></textarea>
       <p class="hint">
-        One hostname per line; subdomains are included. These are disguised from
-        the very first request, so the site never sees you undisguised at all.
+        One hostname per line; subdomains are included. In local mode these are
+        disguised from the very first request, so the site never sees you
+        undisguised at all; in server mode they are redirected to the server
+        before the page loads.
       </p>
     </fieldset>
 

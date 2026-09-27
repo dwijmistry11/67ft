@@ -1,4 +1,5 @@
 import { loadSettings, actionFor, ruleDomain } from './profiles.js';
+import { isProxiedPage, proxiedUrl } from './server.js';
 
 // Two populations of rules, because they answer different questions.
 //
@@ -70,6 +71,22 @@ async function disableTab(tabId) {
 
 async function toggleTab(tab) {
   if (!tab?.url || !/^https?:/.test(tab.url)) return;
+  const settings = await loadSettings();
+
+  if (settings.mode === 'server' && settings.serverUrl) {
+    // Already on a proxied page: the toggle means "put it back".
+    if (isProxiedPage(settings.serverUrl, tab.url)) {
+      const original = tab.url.slice(settings.serverUrl.replace(/\/+$/, '').length + 1);
+      try {
+        await chrome.tabs.update(tab.id, { url: decodeURIComponent(original) });
+      } catch {
+        await chrome.tabs.update(tab.id, { url: original });
+      }
+      return;
+    }
+    await chrome.tabs.update(tab.id, { url: proxiedUrl(settings.serverUrl, tab.url) });
+    return;
+  }
 
   const session = await chrome.declarativeNetRequest.getSessionRules();
   if (session.some((r) => r.id === SESSION_ID(tab.id))) {
@@ -93,9 +110,12 @@ async function syncAutoRules() {
   const action = actionFor(settings);
 
   const existing = await chrome.declarativeNetRequest.getDynamicRules();
-  const domains = [...new Set(
-    autoSites.map((s) => ruleDomain(s.trim().toLowerCase())).filter(Boolean),
-  )];
+  // In server mode the same list means "send these to the server", which is a
+  // navigation rather than a header rewrite. Leaving the header rules live
+  // would disguise a request that is not being made from here anyway.
+  const domains = settings.mode === 'local'
+    ? [...new Set(autoSites.map((s) => ruleDomain(s.trim().toLowerCase())).filter(Boolean))]
+    : [];
 
   await chrome.declarativeNetRequest.updateDynamicRules({
     removeRuleIds: existing.map((r) => r.id),
@@ -146,13 +166,31 @@ async function cleanPage(tabId) {
 }
 
 chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
+  const settings = await loadSettings();
+
+  // Auto-sites in server mode are a redirect, and it has to happen before the
+  // page loads rather than after.
+  if (info.status === 'loading' && settings.mode === 'server' && settings.serverUrl
+      && tab.url && /^https?:/.test(tab.url)
+      && !isProxiedPage(settings.serverUrl, tab.url)
+      && matchesAutoSite(new URL(tab.url).hostname, settings.autoSites)) {
+    await chrome.tabs.update(tabId, { url: proxiedUrl(settings.serverUrl, tab.url) });
+    return;
+  }
+
   if (info.status !== 'complete') return;
-  if (!(await activeFor(tab))) {
+
+  // The server strips scripts but leaves the paywall overlay standing as inert
+  // markup, so its output is exactly what the reader pass is for.
+  const viaServer = isProxiedPage(settings.serverUrl, tab.url || '');
+  const viaLocal = await activeFor(tab);
+
+  if (!viaServer && !viaLocal) {
     await chrome.action.setBadgeText({ tabId, text: '' });
     return;
   }
 
-  await chrome.action.setBadgeText({ tabId, text: 'ON' });
+  await chrome.action.setBadgeText({ tabId, text: viaServer ? 'SRV' : 'ON' });
   await chrome.action.setBadgeBackgroundColor({ tabId, color: '#7c6af7' });
   await cleanPage(tabId);
 });
@@ -164,7 +202,15 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 
 // ------------------------------------------------------------------- the wiring
 
-chrome.action.onClicked.addListener(toggleTab);
+// The popup handles the click, so action.onClicked no longer fires. The same
+// dispatch is still reachable from the keyboard shortcut and the context menu.
+chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
+  if (msg?.type === 'enable-local') {
+    chrome.tabs.get(msg.tabId).then(enableTab).then(() => respond({ ok: true }));
+    return true; // respond asynchronously
+  }
+  return false;
+});
 
 chrome.commands.onCommand.addListener(async (command) => {
   if (command !== 'toggle-tab') return;

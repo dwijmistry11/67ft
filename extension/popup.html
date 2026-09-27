@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>67ft</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --accent: #7c6af7;
+    --ok: #3fa96b; --warn: #c9903a; --bad: #d05a5a;
+    --line: #8883; --dim: #8888a0;
+  }
+  * { box-sizing: border-box; }
+  body {
+    width: 320px; margin: 0; padding: 0;
+    font: 13px/1.5 system-ui, -apple-system, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: .5rem;
+    padding: .7rem .9rem; border-bottom: 1px solid var(--line);
+  }
+  header h1 { font-size: 1rem; margin: 0; flex: 1; letter-spacing: -.01em; }
+  header h1 span { color: var(--accent); }
+  .icon-btn {
+    border: 0; background: none; cursor: pointer; padding: .2rem .35rem;
+    font-size: .95rem; border-radius: 5px; color: inherit; opacity: .65;
+  }
+  .icon-btn:hover { opacity: 1; background: #8882; }
+
+  section { padding: .75rem .9rem; border-bottom: 1px solid var(--line); }
+  .label {
+    font-size: .68rem; text-transform: uppercase; letter-spacing: .07em;
+    color: var(--dim); margin-bottom: .4rem; font-weight: 600;
+  }
+
+  /* server status */
+  .status { display: flex; align-items: flex-start; gap: .55rem; }
+  .dot {
+    width: 8px; height: 8px; border-radius: 50%; margin-top: .4rem;
+    background: var(--dim); flex: none;
+  }
+  .dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); }
+  .dot.warn { background: var(--warn); }
+  .dot.probing { background: var(--warn); animation: pulse 1s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: .25; } }
+  .status-main { flex: 1; min-width: 0; }
+  .status-host {
+    font-family: ui-monospace, SFMono-Regular, monospace; font-size: .82rem;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .status-detail { color: var(--dim); font-size: .78rem; }
+
+  /* current page */
+  .host {
+    font-family: ui-monospace, SFMono-Regular, monospace; font-size: .82rem;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .pill {
+    display: inline-block; font-size: .68rem; padding: .1rem .4rem;
+    border-radius: 999px; background: var(--accent); color: #fff;
+    font-weight: 600; margin-left: .35rem; vertical-align: 1px;
+  }
+  .pill.off { background: #8886; }
+
+  button.action {
+    width: 100%; font: inherit; font-weight: 600; padding: .5rem;
+    border: 0; border-radius: 7px; background: var(--accent); color: #fff;
+    cursor: pointer; margin-top: .55rem;
+  }
+  button.action.secondary { background: #8883; color: inherit; font-weight: 500; }
+  button.action:disabled { opacity: .45; cursor: default; }
+
+  /* mode switch */
+  .modes { display: flex; gap: .4rem; }
+  .mode {
+    flex: 1; border: 1px solid var(--line); border-radius: 7px; padding: .45rem;
+    text-align: center; cursor: pointer; font-size: .78rem;
+  }
+  .mode.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); font-weight: 600; }
+  .mode small { display: block; color: var(--dim); font-size: .67rem; font-weight: 400; }
+
+  label.check { display: flex; align-items: center; gap: .45rem; cursor: pointer; }
+
+  /* diagnostics */
+  table { width: 100%; border-collapse: collapse; font-size: .78rem; }
+  td { padding: .12rem 0; }
+  td:last-child {
+    text-align: right; font-family: ui-monospace, SFMono-Regular, monospace;
+  }
+  td.k { color: var(--dim); }
+  .hint { color: var(--dim); font-size: .72rem; margin-top: .4rem; }
+  input[type=text] {
+    width: 100%; padding: .35rem .45rem; font: inherit; font-size: .78rem;
+    border: 1px solid var(--line); border-radius: 6px;
+    background: #8881; color: inherit;
+  }
+</style>
+</head>
+<body>
+  <header>
+    <h1><span>67</span>ft</h1>
+    <button class="icon-btn" id="recheck" title="Re-check server">&#8635;</button>
+    <button class="icon-btn" id="options" title="Options">&#9881;</button>
+  </header>
+
+  <section>
+    <div class="label">Server</div>
+    <div class="status">
+      <div class="dot probing" id="dot"></div>
+      <div class="status-main">
+        <div class="status-host" id="server-host">checking…</div>
+        <div class="status-detail" id="server-detail">&nbsp;</div>
+      </div>
+    </div>
+    <div id="server-setup" hidden>
+      <input type="text" id="server-input" placeholder="http://67ft.lan:8080" spellcheck="false">
+      <button class="action secondary" id="server-save">Save server</button>
+      <button class="action secondary" id="server-discover">Find it for me</button>
+    </div>
+  </section>
+
+  <section>
+    <div class="label">This page</div>
+    <div class="host" id="page-host">—<span class="pill off" id="page-pill">off</span></div>
+    <button class="action" id="go">Read it</button>
+    <button class="action secondary" id="restore" hidden>Back to the original</button>
+  </section>
+
+  <section>
+    <div class="label">Mode</div>
+    <div class="modes">
+      <div class="mode" id="mode-local" data-mode="local">
+        Local<small>this browser</small>
+      </div>
+      <div class="mode" id="mode-server" data-mode="server">
+        Server<small>via the Pi</small>
+      </div>
+    </div>
+    <label class="check" style="margin-top:.6rem">
+      <input type="checkbox" id="auto"> Always, for <span id="auto-host">this site</span>
+    </label>
+  </section>
+
+  <section id="diag-section">
+    <div class="label">Diagnostics</div>
+    <table id="diag"></table>
+    <button class="action secondary" id="test" disabled>Test this page through the server</button>
+    <div class="hint" id="test-hint">Fetches without navigating, and reports what the server did.</div>
+  </section>
+
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

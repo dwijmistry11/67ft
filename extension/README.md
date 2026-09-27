@@ -3,9 +3,19 @@
 The same idea as the server in this repo, moved into the browser: request the
 page as a crawler, and refuse to run the publisher's JavaScript over the answer.
 
-Nothing is proxied. The tab still loads the real URL from the real origin, so
-relative assets, character encodings and images work without any of the HTML
-rewriting the server build has to do.
+It works two ways, switched from the popup:
+
+**Local** — nothing is proxied. The tab loads the real URL from the real
+origin, disguised by header rules, so relative assets, character encodings and
+images work without any of the HTML rewriting the server build has to do. The
+publisher sees your address.
+
+**Server** — the tab is sent to a 67ft server, which fetches the page from its
+own address and returns it rewritten. The only mode where the publisher never
+learns which machine was curious, and the only one that benefits from the
+server's cache. The extension then runs its reader pass over the result, which
+the server cannot do for itself — so the combination reads better than either
+half alone.
 
 ## Install
 
@@ -17,16 +27,36 @@ rewriting the server build has to do.
 
 | | |
 |---|---|
-| Toolbar button | Reload the current tab as a crawler. Click again to go back. |
+| Toolbar button | Opens the popup: server status, the current page, mode, diagnostics. |
 | `Alt+Shift+R` | The same toggle, without the mouse. |
 | Right-click → *Always 67ft this site* | Add the site to the auto list. |
 | Right-click → *67ft this page* | The toolbar button, from the page. |
 
-A violet **ON** badge means the tab is disguised.
+A violet **ON** badge means the tab is disguised locally; **SRV** means you are
+reading it through the server.
 
-Sites on the auto list are handled by a persistent, domain-scoped rule rather
-than a per-tab one, so the disguise is on for the very first request of the
-navigation and the publisher never sees an undisguised visit at all.
+### The popup
+
+- **Server** — a live dot, the address, and the round-trip time to `/health`.
+  With no server set it probes `67ft.lan`, `bliss.local` and `localhost` on
+  port 8080 and keeps the first that answers; you can also type one in, scheme
+  optional.
+- **This page** — the site, whether you are reading it direct or through the
+  server, and one button to read it. On a proxied page the button turns into
+  *Back to the original*, so the round trip works both ways.
+- **Mode** — local or server, and *Always, for this site*, which applies the
+  current mode to that domain from now on.
+- **Diagnostics** — fetches the current page through the server *without
+  navigating*, and reports the status, size, time, and whether the server
+  answered from its cache. A `hit` means the publisher was never contacted at
+  all.
+
+Sites on the auto list are handled, in local mode, by a persistent
+domain-scoped rule rather than a per-tab one, so the disguise is on for the
+very first request of the navigation and the publisher never sees an
+undisguised visit at all. In server mode the same list redirects to the server
+before the page loads, and the header rules are withdrawn — the request is not
+being made from this browser, so disguising it here would mean nothing.
 
 ## Options
 
@@ -88,9 +118,9 @@ the server's HTML there is nothing for a crawler to have been shown.
 never letting the request reach the network where our headers apply. Clear the
 site's data once if a site seems stuck, or put it on the auto list.
 
-**Only this browser, on this machine.** The Rust server in the parent directory
-is still the answer for a phone or a tablet — and it caches, which this does
-not.
+**Local mode is only this browser, on this machine.** The Rust server in the
+parent directory is still the answer for a phone or a tablet — which is what
+server mode is for, and where the caching lives.
 
 **Do not expect to publish it.** The Chrome Web Store removes paywall
 circumvention extensions. Loading it unpacked, or handing someone a zip, is the
@@ -102,6 +132,8 @@ distribution story.
 |---|---|
 | `manifest.json` | MV3 manifest. Chrome 116+, for `requestDomains`. |
 | `profiles.js` | Header profiles, settings, and the rule they compile to. |
+| `server.js` | Talking to a 67ft server: health, discovery, URL round-tripping. |
+| `popup.html` / `popup.js` | The toolbar popup: status, mode, diagnostics. |
 | `background.js` | Rule lifecycle: per-tab toggle, auto-site rules, injection. |
 | `reader.js` | The DOM pass. |
 | `reader.css` | Scroll and selection unlocking. |
