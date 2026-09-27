@@ -1,7 +1,7 @@
 import { loadSettings, ruleDomain } from './profiles.js';
 import {
   checkHealth, discoverServer, isProxiedPage, normalizeServer,
-  proxiedUrl, testFetch, unproxyUrl,
+  testFetch, unproxyUrl,
 } from './server.js';
 
 const $ = (id) => document.getElementById(id);
@@ -131,11 +131,28 @@ function paintPage() {
 
 /* ------------------------------------------------------------------ actions */
 
+function showNotice(text) {
+  $('notice').textContent = text;
+  $('notice').hidden = !text;
+}
+
 async function go() {
-  const url = targetUrl();
   if (state.settings.mode === 'server') {
     if (!state.health?.ok) return;
-    await chrome.tabs.update(state.tab.id, { url: proxiedUrl(state.settings.serverUrl, url) });
+    $('go').textContent = 'checking…';
+    $('go').disabled = true;
+
+    // The background asks the server whether it can fetch this page before
+    // sending the tab anywhere, so a bot wall never becomes the thing you are
+    // looking at.
+    const r = await chrome.runtime.sendMessage({ type: 'go-server', tabId: state.tab.id });
+    if (!r?.ok) {
+      $('go').textContent = 'Read via the server';
+      $('go').disabled = false;
+      showNotice(`Not sent: ${r?.reason || 'the server could not fetch it'}. `
+        + 'This page is often readable here as it is — try Local instead.');
+      return;
+    }
   } else {
     await chrome.runtime.sendMessage({ type: 'enable-local', tabId: state.tab.id });
   }
@@ -166,6 +183,13 @@ async function init() {
 
   paintPage();
   paintServer();
+
+  const { lastFallback } = await chrome.storage.session.get('lastFallback');
+  if (lastFallback && lastFallback.host === tabHost()
+      && Date.now() - lastFallback.at < 60_000) {
+    showNotice(`Not sent: ${lastFallback.reason}. Showing the original, `
+      + 'which is often readable as it is.');
+  }
 
   // A server that was never configured is worth one quiet probe: the common
   // case is that one is running on a name the defaults already know.

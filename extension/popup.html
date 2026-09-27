@@ -79,6 +79,12 @@
   .mode.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); font-weight: 600; }
   .mode small { display: block; color: var(--dim); font-size: .67rem; font-weight: 400; }
 
+  .notice {
+    margin-top: .55rem; padding: .45rem .55rem; border-radius: 6px;
+    background: color-mix(in srgb, var(--warn) 18%, transparent);
+    border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent);
+    font-size: .76rem; line-height: 1.45;
+  }
   label.check { display: flex; align-items: center; gap: .45rem; cursor: pointer; }
 
   /* diagnostics */
@@ -124,6 +130,7 @@
     <div class="host" id="page-host">—<span class="pill off" id="page-pill">off</span></div>
     <button class="action" id="go">Read it</button>
     <button class="action secondary" id="restore" hidden>Back to the original</button>
+    <div class="notice" id="notice" hidden></div>
   </section>
 
   <section>
