@@ -1,5 +1,5 @@
 import { loadSettings, actionFor, ruleDomain } from './profiles.js';
-import { isProxiedPage, proxiedUrl } from './server.js';
+import { isProxiedPage, probeProxy, proxiedUrl } from './server.js';
 
 // Two populations of rules, because they answer different questions.
 //
@@ -84,7 +84,7 @@ async function toggleTab(tab) {
       }
       return;
     }
-    await chrome.tabs.update(tab.id, { url: proxiedUrl(settings.serverUrl, tab.url) });
+    await goViaServer(tab, settings);
     return;
   }
 
@@ -94,6 +94,38 @@ async function toggleTab(tab) {
   } else {
     await enableTab(tab);
   }
+}
+
+/**
+ * Send a tab through the server, unless the server cannot fetch it.
+ *
+ * Roughly one site in seven answers a crawler with a bot wall rather than the
+ * article — Cloudflare's "Just a moment", a captcha, a redirect loop. Left
+ * alone the reader lands on that instead of the page they asked for, and the
+ * page they asked for was very often readable in this browser all along. So
+ * ask first, and stay put when the answer is no.
+ */
+async function goViaServer(tab, settings) {
+  const target = tab.url;
+  const probe = await probeProxy(settings.serverUrl, target);
+
+  if (probe.ok) {
+    await chrome.tabs.update(tab.id, { url: proxiedUrl(settings.serverUrl, target) });
+    return { ok: true };
+  }
+
+  // Not an error to report so much as a route that is closed: the tab stays on
+  // a page that, unlike the server's copy, the browser can usually read.
+  await chrome.storage.session.set({
+    lastFallback: { host: new URL(target).hostname, reason: probe.reason, at: Date.now() },
+  });
+  await chrome.action.setBadgeText({ tabId: tab.id, text: '!' });
+  await chrome.action.setBadgeBackgroundColor({ tabId: tab.id, color: '#c9903a' });
+  await chrome.action.setTitle({
+    tabId: tab.id,
+    title: `67ft — ${probe.reason}. Showing the original.`,
+  });
+  return { ok: false, reason: probe.reason };
 }
 
 // ------------------------------------------------------------------ auto sites
@@ -174,7 +206,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
       && tab.url && /^https?:/.test(tab.url)
       && !isProxiedPage(settings.serverUrl, tab.url)
       && matchesAutoSite(new URL(tab.url).hostname, settings.autoSites)) {
-    await chrome.tabs.update(tabId, { url: proxiedUrl(settings.serverUrl, tab.url) });
+    await goViaServer(tab, settings);
     return;
   }
 
@@ -190,6 +222,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
     return;
   }
 
+  await chrome.action.setTitle({ tabId, title: '67ft' });
   await chrome.action.setBadgeText({ tabId, text: viaServer ? 'SRV' : 'ON' });
   await chrome.action.setBadgeBackgroundColor({ tabId, color: '#7c6af7' });
   await cleanPage(tabId);
@@ -208,6 +241,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
   if (msg?.type === 'enable-local') {
     chrome.tabs.get(msg.tabId).then(enableTab).then(() => respond({ ok: true }));
     return true; // respond asynchronously
+  }
+  if (msg?.type === 'go-server') {
+    (async () => {
+      const tab = await chrome.tabs.get(msg.tabId);
+      respond(await goViaServer(tab, await loadSettings()));
+    })();
+    return true;
   }
   return false;
 });
