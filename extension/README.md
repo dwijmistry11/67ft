@@ -110,14 +110,13 @@ which the policy we just imposed does not govern:
 
 Roughly one site in seven answers a crawler with a bot wall rather than an
 article, and it is usually a site a normal browser reads without complaint.
-Both modes now check rather than assume.
 
-In server mode the extension asks the server for the page before sending the
-tab anywhere, and stays put if the server cannot fetch it. In local mode it
-looks at the page the disguise produced, and if that page is a challenge or a
-block it withdraws the disguise for that site, reloads it normally, and says so
-with a **!** badge. The site is set aside for the rest of the browser session
-only; the popup offers to try it again.
+Neither mode second-guesses you about it. The page you asked for is fetched,
+and if what comes back looks like a challenge rather than an article you get a
+**!** badge and a line in the popup saying which route produced it — then the
+toolbar button turns it off. A status code on one URL is a poor way to decide
+whether a page is worth reading, and being overruled by that guess is worse
+than seeing the page and deciding.
 
 Quora is the case this was built for: a Cloudflare challenge for the server and
 for the disguise, and twelve thousand characters of article for plain Chrome.

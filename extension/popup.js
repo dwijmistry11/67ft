@@ -8,8 +8,8 @@ const $ = (id) => document.getElementById(id);
 const state = {
   settings: null, tab: null, health: null,
   lastCheck: null, lastTest: null,
-  // Whether the disguise is currently applied to this tab, by either route.
-  localOn: false, suppressed: [],
+  // Whether the disguise is currently applied to this tab.
+  localOn: false,
 };
 
 /* ------------------------------------------------------------------ helpers */
@@ -36,8 +36,6 @@ function targetUrl() {
  */
 async function readLocalState() {
   const host = tabHost();
-  state.suppressed = (await chrome.storage.session.get('suppressedHosts')).suppressedHosts || [];
-
   const rules = await chrome.declarativeNetRequest.getSessionRules();
   if (rules.some((r) => r.condition?.tabIds?.includes(state.tab.id))) {
     state.localOn = true;
@@ -45,7 +43,6 @@ async function readLocalState() {
   }
   const domain = host && ruleDomain(host);
   state.localOn = !!domain
-    && !state.suppressed.includes(domain)
     && state.settings.autoSites.some((s) => ruleDomain(s) === domain);
 }
 
@@ -159,8 +156,7 @@ function paintPage() {
   pill.className = proxied || state.localOn ? 'pill' : 'pill off';
 
   $('auto-host').textContent = host ? ruleDomain(host) : 'this site';
-  $('auto').checked = !!host && autoSites.some((s) => ruleDomain(s) === ruleDomain(host))
-    && !state.suppressed.includes(ruleDomain(host));
+  $('auto').checked = !!host && autoSites.some((s) => ruleDomain(s) === ruleDomain(host));
 
   for (const el of document.querySelectorAll('.mode')) {
     el.classList.toggle('on', el.dataset.mode === mode);
@@ -182,20 +178,7 @@ async function go() {
   }
   if (state.settings.mode === 'server') {
     if (!state.health?.ok) return;
-    $('go').textContent = 'checking…';
-    $('go').disabled = true;
-
-    // The background asks the server whether it can fetch this page before
-    // sending the tab anywhere, so a bot wall never becomes the thing you are
-    // looking at.
-    const r = await chrome.runtime.sendMessage({ type: 'go-server', tabId: state.tab.id });
-    if (!r?.ok) {
-      $('go').textContent = 'Read via the server';
-      $('go').disabled = false;
-      showNotice(`Not sent: ${r?.reason || 'the server could not fetch it'}. `
-        + 'This page is often readable here as it is — try Local instead.');
-      return;
-    }
+    await chrome.runtime.sendMessage({ type: 'go-server', tabId: state.tab.id });
   } else {
     await chrome.runtime.sendMessage({ type: 'enable-local', tabId: state.tab.id });
   }
@@ -228,25 +211,14 @@ async function init() {
   paintPage();
   paintServer();
 
-  const host = tabHost();
-  const domain = host && ruleDomain(host);
-  if (domain && state.suppressed.includes(domain)) {
-    showNotice(`${domain} refuses the crawler disguise, so it is switched off `
-      + 'here and showing normally. Click to try it again.');
-    $('notice').style.cursor = 'pointer';
-    $('notice').onclick = async () => {
-      await chrome.runtime.sendMessage({ type: 'unsuppress', domain });
-      showNotice('');
-      chrome.tabs.reload(state.tab.id);
-      window.close();
-    };
-  } else {
-    const { lastFallback } = await chrome.storage.session.get('lastFallback');
-    if (lastFallback && lastFallback.host === host
-        && Date.now() - lastFallback.at < 60_000) {
-      showNotice(`Not sent: ${lastFallback.reason}. Showing the original, `
-        + 'which is often readable as it is.');
-    }
+  const { lastFallback } = await chrome.storage.session.get('lastFallback');
+  if (lastFallback && lastFallback.host === tabHost()
+      && Date.now() - lastFallback.at < 120_000) {
+    showNotice(lastFallback.route === 'server'
+      ? 'This looks like a bot wall rather than the article. The server is '
+        + 'blocked here — the site is often readable in this browser as it is.'
+      : 'This looks like a bot wall rather than the article. This site refuses '
+        + 'the crawler disguise — turn it off above to see it normally.');
   }
 
   // A server that was never configured is worth one quiet probe: the common

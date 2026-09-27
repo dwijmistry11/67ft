@@ -1,5 +1,5 @@
 import { loadSettings, actionFor, ruleDomain } from './profiles.js';
-import { isProxiedPage, probeProxy, proxiedUrl } from './server.js';
+import { isProxiedPage, proxiedUrl } from './server.js';
 
 // Two populations of rules, because they answer different questions.
 //
@@ -14,12 +14,6 @@ import { isProxiedPage, probeProxy, proxiedUrl } from './server.js';
 const SESSION_ID = (tabId) => tabId + 1; // rule ids must be >= 1
 const AUTO_ID_BASE = 1_000_000;
 
-/** Hosts withdrawn from local mode this session because they bot-walled us. */
-async function suppressed() {
-  const { suppressedHosts } = await chrome.storage.session.get('suppressedHosts');
-  return suppressedHosts || [];
-}
-
 /** Is 67ft active for this tab — by manual toggle, or because the site is on the auto list? */
 async function activeFor(tab) {
   if (!tab?.url || !/^https?:/.test(tab.url)) return false;
@@ -27,11 +21,8 @@ async function activeFor(tab) {
   const session = await chrome.declarativeNetRequest.getSessionRules();
   if (session.some((r) => r.id === SESSION_ID(tab.id))) return true;
 
-  const host = new URL(tab.url).hostname;
-  if ((await suppressed()).includes(ruleDomain(host.toLowerCase()))) return false;
-
   const { autoSites } = await loadSettings();
-  return matchesAutoSite(host, autoSites);
+  return matchesAutoSite(new URL(tab.url).hostname, autoSites);
 }
 
 function matchesAutoSite(hostname, autoSites) {
@@ -106,35 +97,17 @@ async function toggleTab(tab) {
 }
 
 /**
- * Send a tab through the server, unless the server cannot fetch it.
+ * Send a tab through the server.
  *
- * Roughly one site in seven answers a crawler with a bot wall rather than the
- * article — Cloudflare's "Just a moment", a captcha, a redirect loop. Left
- * alone the reader lands on that instead of the page they asked for, and the
- * page they asked for was very often readable in this browser all along. So
- * ask first, and stay put when the answer is no.
+ * No pre-flight check. Some sites answer a crawler with a bot wall, and the
+ * extension used to refuse the navigation on that basis — but a status code on
+ * one URL is a poor proxy for whether the page is worth reading, and being
+ * overruled by a guess is worse than seeing the page and deciding. If it is
+ * not the page you wanted, the toolbar button turns it off.
  */
 async function goViaServer(tab, settings) {
-  const target = tab.url;
-  const probe = await probeProxy(settings.serverUrl, target);
-
-  if (probe.ok) {
-    await chrome.tabs.update(tab.id, { url: proxiedUrl(settings.serverUrl, target) });
-    return { ok: true };
-  }
-
-  // Not an error to report so much as a route that is closed: the tab stays on
-  // a page that, unlike the server's copy, the browser can usually read.
-  await chrome.storage.session.set({
-    lastFallback: { host: new URL(target).hostname, reason: probe.reason, at: Date.now() },
-  });
-  await chrome.action.setBadgeText({ tabId: tab.id, text: '!' });
-  await chrome.action.setBadgeBackgroundColor({ tabId: tab.id, color: '#c9903a' });
-  await chrome.action.setTitle({
-    tabId: tab.id,
-    title: `67ft — ${probe.reason}. Showing the original.`,
-  });
-  return { ok: false, reason: probe.reason };
+  await chrome.tabs.update(tab.id, { url: proxiedUrl(settings.serverUrl, tab.url) });
+  return { ok: true };
 }
 
 // ------------------------------------------------------------------ auto sites
@@ -154,10 +127,8 @@ async function syncAutoRules() {
   // In server mode the same list means "send these to the server", which is a
   // navigation rather than a header rewrite. Leaving the header rules live
   // would disguise a request that is not being made from here anyway.
-  const off = await suppressed();
   const domains = settings.mode === 'local'
     ? [...new Set(autoSites.map((s) => ruleDomain(s.trim().toLowerCase())).filter(Boolean))]
-        .filter((d) => !off.includes(d))
     : [];
 
   await chrome.declarativeNetRequest.updateDynamicRules({
@@ -236,26 +207,25 @@ async function hitBotWall(tabId) {
   }
 }
 
-async function backOffFrom(tab) {
-  const domain = ruleDomain(new URL(tab.url).hostname.toLowerCase());
-  const list = await suppressed();
-  if (!list.includes(domain)) {
-    await chrome.storage.session.set({ suppressedHosts: [...list, domain] });
-  }
+/**
+ * Say that this page looks like a bot wall, and leave it alone.
+ *
+ * The reader can see the page perfectly well; what they cannot see is which of
+ * the two routes produced it. That is the only thing worth adding.
+ */
+async function flagBotWall(tab, route) {
   await chrome.storage.session.set({
     lastFallback: {
       host: new URL(tab.url).hostname,
-      reason: 'the site blocks the crawler disguise',
+      route,
       at: Date.now(),
     },
   });
-  await syncAutoRules();          // drop it from the persistent rules too
-  await disableTab(tab.id);       // removes the session rule and reloads clean
   await chrome.action.setBadgeText({ tabId: tab.id, text: '!' });
   await chrome.action.setBadgeBackgroundColor({ tabId: tab.id, color: '#c9903a' });
   await chrome.action.setTitle({
     tabId: tab.id,
-    title: '67ft — this site refuses the crawler disguise. Showing it normally.',
+    title: '67ft — this looks like a bot wall. Turn it off to see the site normally.',
   });
 }
 
@@ -280,28 +250,13 @@ chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
   const viaLocal = await activeFor(tab);
 
   if (!viaServer && !viaLocal) {
-    // A site we backed off from is not simply "off": the reload that follows
-    // backOffFrom lands here and would otherwise wipe the warning badge it
-    // just set, leaving no sign that the disguise was withdrawn.
-    const host = tab.url && /^https?:/.test(tab.url)
-      ? ruleDomain(new URL(tab.url).hostname.toLowerCase()) : null;
-    if (host && (await suppressed()).includes(host)) {
-      await chrome.action.setBadgeText({ tabId, text: '!' });
-      await chrome.action.setBadgeBackgroundColor({ tabId, color: '#c9903a' });
-      await chrome.action.setTitle({
-        tabId,
-        title: '67ft — this site refuses the crawler disguise. Showing it normally.',
-      });
-      return;
-    }
     await chrome.action.setBadgeText({ tabId, text: '' });
     await chrome.action.setTitle({ tabId, title: '67ft' });
     return;
   }
 
-  // Before anything else: if the disguise is what produced this page, undo it.
-  if (viaLocal && (await hitBotWall(tabId))) {
-    await backOffFrom(tab);
+  if (await hitBotWall(tabId)) {
+    await flagBotWall(tab, viaServer ? 'server' : 'local');
     return;
   }
 
@@ -327,17 +282,6 @@ chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
   }
   if (msg?.type === 'disable-local') {
     disableTab(msg.tabId).then(() => respond({ ok: true }));
-    return true;
-  }
-  if (msg?.type === 'unsuppress') {
-    (async () => {
-      const list = await suppressed();
-      await chrome.storage.session.set({
-        suppressedHosts: list.filter((d) => d !== msg.domain),
-      });
-      await syncAutoRules();
-      respond({ ok: true });
-    })();
     return true;
   }
   if (msg?.type === 'go-server') {
