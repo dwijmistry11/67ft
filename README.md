@@ -4,6 +4,9 @@ Self-hosted paywall bypass proxy — a fast, single-binary Rust alternative to [
 
 Pretends to be Googlebot to fetch full article content. Runs as a single static binary with no runtime dependencies. Designed to run on a Raspberry Pi 3B.
 
+Also available as a Chrome extension in [`extension/`](extension/), which does
+the same job with no server at all — see [Two ways to run this](#two-ways-to-run-this).
+
 ---
 
 ## Run (dev)
@@ -59,6 +62,30 @@ put it behind something that authenticates, if that matters to you.
 | `GET /health` | Health check |
 
 Example: `http://localhost:8080/https://example.com/some-article`
+
+## Two ways to run this
+
+|  | Server | Extension |
+|---|---|---|
+| Reaches | anything on your network — phone, tablet, another laptop | Chrome, on one machine |
+| Setup | a host that stays on | Load unpacked, once |
+| Caching | yes, in memory | no |
+| Assets, encodings, relative links | rewritten by `proxy.rs` | untouched — the page loads from its real origin |
+| Overlay and blur removal | no — they survive as inert markup | yes, `extension/reader.js` |
+| Cookies on the article request | none | none |
+| Cookies on the images and CSS | your own | your own |
+| IP the publisher sees | the server's | yours |
+| Requests before you ask for one | none | one, unless the site is on the auto list |
+| Crawler verification by reverse DNS | defeats neither | defeats neither |
+
+They are independent; running both is fine. The extension is the better desktop
+reader, the server is the only one that can serve a phone.
+
+Neither hides you completely. Both fetch the article itself without cookies,
+but `<base href>` on one side and a plain origin load on the other mean your
+own browser fetches the images and stylesheets straight from the publisher,
+carrying the cookies and the session the article request went to such trouble
+to omit.
 
 ## Bookmarklet
 
